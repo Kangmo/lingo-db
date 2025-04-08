@@ -7,7 +7,12 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "C++ standard to conform to")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DTRACER")
 
-
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Silence warning about default label in switch which covers all enumeration values (false positive)
+    add_compile_options(-Wno-covered-switch-default)
+    # Silence warning about dangling assignment in GSL (false positive)
+    add_compile_options(-Wno-dangling-assignment-gsl)
+endif ()
 
 # Define ASAN build type if not already set
 if(NOT CMAKE_BUILD_TYPE)
@@ -39,13 +44,8 @@ find_package(Clang 20.1 REQUIRED)
 find_package(LLVM 20.1 REQUIRED)
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 set (MLIR_DIR "${LLVM_DIR}/../mlir")
-find_package(MLIR 20.1 REQUIRED)
-
-set(LLVM_BUILD_STATIC ON)
-
-
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+find_package(MLIR 20.1 REQUIRED)
 
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
@@ -78,9 +78,12 @@ set(LLVM_LINK_COMPONENTS
         Core
         nativecodegen
         OrcJIT
-        X86
 )
-
+if(APPLE)
+    set(LLVM_LINK_COMPONENTS ${LLVM_LINK_COMPONENTS} AArch64)
+else()
+    set(LLVM_LINK_COMPONENTS ${LLVM_LINK_COMPONENTS} X86)
+endif()
 
 add_custom_target(build_includes)
 set(runtime_funcs_ptr_libs "")
@@ -163,7 +166,6 @@ set(LIBS
         MLIRSideEffectInterfaces
         MLIRTransforms
         MLIRMathTransforms
-        MLIRExecutionEngine
 )
 set(PRECOMPILED_CC_PATH "${CMAKE_CURRENT_BINARY_DIR}/precompiled_bitcode.cc")
 add_subdirectory(src/catalog)
@@ -175,8 +177,3 @@ add_subdirectory(tools)
 if (ENABLE_TESTS)
     add_subdirectory(test)
 endif ()
-
-
-
-
-
