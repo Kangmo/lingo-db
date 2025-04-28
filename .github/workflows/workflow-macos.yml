@@ -1,7 +1,6 @@
 name: build+test (macOS)
 
 on:
-  push:
   pull_request:
 
 jobs:
@@ -188,7 +187,7 @@ jobs:
       - name: Test
         run: |
           export ASAN_OPTIONS="detect_leaks=0 detect_container_overflow=0"
-          chmod +x ./build/lingodb-${{ matrix.build_type }}/sql
+          chmod +x ./build/lingodb-${{ matrix.build_type }}/sqlite-tester
 
           ./build/lingodb-${{ matrix.build_type }}/sqlite-tester test/sqlite-datasets/tpchSf1.test ~/db/tpch-1
           ./build/lingodb-${{ matrix.build_type }}/sqlite-tester test/sqlite-datasets/tpcdsSf1.test ~/db/tpcds-1
