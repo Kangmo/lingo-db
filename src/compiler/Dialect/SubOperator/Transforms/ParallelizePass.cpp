@@ -24,8 +24,7 @@ static constexpr bool IS_X86 =
 #else
    false
 #endif
-;
-
+   ;
 
 struct ProblematicOp {
    subop::SubOperator op;
