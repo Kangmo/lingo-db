@@ -1,4 +1,5 @@
 #include "lingodb/runtime/storage/LingoDBTable.h"
+#include "lingodb/runtime/storage/RocksDBStorage.h"
 #include "lingodb/catalog/Defs.h"
 #include "lingodb/runtime/RecordBatchInfo.h"
 #include "lingodb/scheduler/Tasks.h"
@@ -6,7 +7,7 @@
 #include "lingodb/utility/Tracer.h"
 
 #include <arrow/builder.h>
-#include <arrow/compute/api.h>
+#include <arrow/compute/api_vector.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <arrow/table.h>
@@ -109,7 +110,7 @@ std::shared_ptr<arrow::RecordBatch> createSample(const std::vector<lingodb::runt
          }
          auto indices = numericBuilder.Finish().ValueOrDie();
          std::vector<arrow::Datum> args({data[currBatch].data(), indices});
-         auto res = arrow::compute::CallFunction("take", args).ValueOrDie();
+         auto res = arrow::compute::Take(args[0], args[1]).ValueOrDie();
          sampleData.push_back(res.record_batch());
       }
       batchStart += data[currBatch].data()->num_rows();
@@ -150,365 +151,176 @@ std::shared_ptr<arrow::DataType> toPhysicalType(lingodb::catalog::Type t) {
                return arrow::date32();
             case lingodb::catalog::DateTypeInfo::DateUnit::MILLIS:
                return arrow::date64();
+            default:
+               throw std::runtime_error("unsupported date unit");
          }
       }
-      case TypeId::TIMESTAMP: {
-         arrow::TimeUnit::type timeUnit;
-         auto logicalTimeUnit = t.getInfo<lingodb::catalog::TimestampTypeInfo>()->getUnit();
-         switch (logicalTimeUnit) {
-            case lingodb::catalog::TimestampTypeInfo::TimestampUnit::NANOS:
-               timeUnit = arrow::TimeUnit::NANO;
-               break;
-            case lingodb::catalog::TimestampTypeInfo::TimestampUnit::MICROS:
-               timeUnit = arrow::TimeUnit::MICRO;
-               break;
-            case lingodb::catalog::TimestampTypeInfo::TimestampUnit::MILLIS:
-               timeUnit = arrow::TimeUnit::MILLI;
-               break;
-            case lingodb::catalog::TimestampTypeInfo::TimestampUnit::SECONDS:
-               timeUnit = arrow::TimeUnit::SECOND;
-               break;
-         }
-         return arrow::timestamp(timeUnit);
-      }
-      case TypeId::INTERVAL: {
-         auto intervalUnit = t.getInfo<lingodb::catalog::IntervalTypeInfo>()->getUnit();
-         switch (intervalUnit) {
-            case lingodb::catalog::IntervalTypeInfo::IntervalUnit::DAYTIME:
-               return arrow::day_time_interval();
-            case lingodb::catalog::IntervalTypeInfo::IntervalUnit::MONTH:
-               return arrow::month_interval();
-         }
-      }
-      case TypeId::CHAR:
-         return arrow::fixed_size_binary(t.getInfo<lingodb::catalog::CharTypeInfo>()->getLength());
       case TypeId::STRING:
+      case TypeId::CHAR:
          return arrow::utf8();
       default:
+         std::cerr << "[LingoDBTable] Unsupported type encountered. TypeId: " << static_cast<int>(t.getTypeId()) << std::endl;
          throw std::runtime_error("unsupported type");
    }
 }
-std::optional<size_t> countDistinctValues(std::shared_ptr<arrow::ChunkedArray> column) {
-   //todo: replace with approximate count in the future
-   auto res = arrow::compute::CallFunction("count_distinct", {column});
-   if (res.ok()) {
-      return res.ValueOrDie().scalar_as<arrow::Int64Scalar>().value;
-   }
-   return {};
-}
-
-void access(std::vector<size_t> colIds, lingodb::runtime::RecordBatchInfo* info, const lingodb::runtime::LingoDBTable::TableChunk& chunk, size_t offset = 0, size_t numRows = std::numeric_limits<size_t>::max()) {
-   auto currChunk = chunk.data();
-   for (size_t i = 0; i < colIds.size(); i++) {
-      auto colId = colIds[i];
-      auto& colInfo = info->columnInfo[i];
-      colInfo = chunk.getColumnInfo(colId);
-      colInfo.offset += offset;
-   }
-   info->numRows = std::min(currChunk->num_rows() - offset, numRows);
-}
-
 } // namespace
 
 namespace lingodb::runtime {
-LingoDBTable::TableChunk::TableChunk(std::shared_ptr<arrow::RecordBatch> data, size_t startRowId) : internalData(data), startRowId(startRowId), numRows(data->num_rows()) {
+
+LingoDBTable::TableChunk::TableChunk(std::shared_ptr<arrow::RecordBatch> data, size_t startRowId)
+    : internalData(data), startRowId(startRowId), numRows(data->num_rows()) {
    for (auto colId = 0; colId < data->num_columns(); colId++) {
       columnInfo.push_back(RecordBatchInfo::getColumnInfo(colId, data));
    }
 }
 
+class LingoDBTable::Impl {
+private:
+   std::unique_ptr<RocksDBStorage> storage;
+   bool persist = true;
+   std::string dbDir;
+
+public:
+   Impl(std::string fileName, std::shared_ptr<arrow::Schema> arrowSchema) 
+      : storage(std::make_unique<RocksDBStorage>(fileName, arrowSchema)) {}
+
+   void append(const std::vector<std::shared_ptr<arrow::RecordBatch>>& toAppend) {
+      storage->append(toAppend);
+   }
+
+   void append(const std::shared_ptr<arrow::Table>& table) {
+      storage->append(table);
+   }
+
+   void flush() {
+      storage->flush();
+   }
+
+   std::shared_ptr<arrow::Schema> getSchema() const {
+      return storage->getSchema();
+   }
+
+   const catalog::ColumnStatistics& getColumnStatistics(const std::string& column) const {
+      return storage->getColumnStatistics(column);
+   }
+
+   std::shared_ptr<arrow::DataType> getColumnStorageType(const std::string& columnName) const {
+      return storage->getSchema()->GetFieldByName(columnName)->type();
+   }
+
+   void ensureLoaded() {
+      storage->ensureLoaded();
+   }
+
+   std::pair<const RocksDBStorage::TableChunk*, size_t> getByRowId(size_t rowId) const {
+      return storage->getByRowId(rowId);
+   }
+
+   size_t getColIndex(const std::string& colName) {
+      return storage->getColIndex(colName);
+   }
+
+   std::unique_ptr<scheduler::Task> createScanTask(const ScanConfig& scanConfig) {
+      return storage->createScanTask(scanConfig);
+   }
+
+   size_t getNumRows() const {
+      return storage->getNumRows();
+   }
+
+   const catalog::Sample& getSample() const {
+      return storage->getSample();
+   }
+
+   void setPersist(bool shouldPersist) {
+      persist = shouldPersist;
+   }
+
+   void setDBDir(const std::string& dir) {
+      dbDir = dir;
+   }
+};
+
 std::unique_ptr<LingoDBTable> LingoDBTable::create(const catalog::CreateTableDef& def) {
    arrow::FieldVector fields;
-   for (auto c : def.columns) {
+   for (auto& c : def.columns) {
       fields.push_back(std::make_shared<arrow::Field>(c.getColumnName(), toPhysicalType(c.getLogicalType())));
    }
    auto arrowSchema = std::make_shared<arrow::Schema>(fields);
-   return std::make_unique<LingoDBTable>(def.name + ".arrow", arrowSchema);
+   std::string fileName = def.name + ".arrow";
+   return std::make_unique<LingoDBTable>(fileName, arrowSchema);
 }
-LingoDBTable::LingoDBTable(std::string fileName, std::shared_ptr<arrow::Schema> arrowSchema) : persist(false), fileName(std::move(fileName)), sample(arrowSchema), schema(std::move(arrowSchema)), tableData(), numRows(0) {
-   for (auto c : schema->fields()) {
-      columnStatistics[c->name()] = catalog::ColumnStatistics(std::nullopt);
-   }
+
+LingoDBTable::LingoDBTable(std::string fileName, std::shared_ptr<arrow::Schema> arrowSchema)
+    : impl(std::make_unique<Impl>(fileName, arrowSchema)), fileName(std::move(fileName)), sample(arrowSchema) {
 }
+
+LingoDBTable::~LingoDBTable() = default;
+
 void LingoDBTable::append(const std::shared_ptr<arrow::Table>& table) {
-   std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-   arrow::TableBatchReader reader(table);
-   std::shared_ptr<arrow::RecordBatch> nextChunk;
-   while (reader.ReadNext(&nextChunk) == arrow::Status::OK()) {
-      if (nextChunk) {
-         batches.push_back(nextChunk);
-      } else {
-         break;
-      }
-      nextChunk.reset();
-   }
-   append(batches);
+   impl->append(table);
 }
+
 void LingoDBTable::append(const std::vector<std::shared_ptr<arrow::RecordBatch>>& toAppend) {
-   ensureLoaded();
-   for (auto& batch : toAppend) {
-      if (batch->schema()->Equals(*schema)) {
-         tableData.push_back(TableChunk{batch, numRows});
-         numRows += batch->num_rows();
-      } else {
-         std::cout << "schema to add: " << batch->schema()->ToString() << std::endl;
-         std::cout << "schema of table: " << schema->ToString() << std::endl;
-         throw std::runtime_error("schema mismatch");
-      }
-   }
-   sample = createSample(tableData);
-   auto tableView = arrow::Table::FromRecordBatches(toAppend).ValueOrDie();
-   for (auto c : schema->fields()) {
-      columnStatistics[c->name()] = catalog::ColumnStatistics(countDistinctValues(tableView->GetColumnByName(c->name())));
-   }
-   flush();
+   impl->append(toAppend);
 }
-const catalog::ColumnStatistics& LingoDBTable::getColumnStatistics(std::string column) const {
-   if (!columnStatistics.contains(column)) {
-      throw std::runtime_error("MetaData: Column not found");
-   }
-   return columnStatistics.at(column);
-}
+
 void LingoDBTable::flush() {
-   if (!persist) return;
-   ensureLoaded();
-   storeTable(dbDir + "/" + fileName, schema, tableData);
+   impl->flush();
+}
+
+const catalog::ColumnStatistics& LingoDBTable::getColumnStatistics(std::string column) const {
+   return impl->getColumnStatistics(column);
 }
 
 std::shared_ptr<arrow::DataType> LingoDBTable::getColumnStorageType(const std::string& columnName) const {
-   auto field = schema->GetFieldByName(columnName);
-   if (!field) {
-      throw std::runtime_error("column not found");
-   }
-   return field->type();
+   return impl->getColumnStorageType(columnName);
 }
+
 void LingoDBTable::ensureLoaded() {
-   if (!loaded) {
-      loaded = true;
-      if (fileName.empty() || dbDir.empty()) {
-         return;
-      }
-      if (!std::filesystem::exists(dbDir + "/" + fileName)) {
-         return;
-      }
-      tableData = loadTable(dbDir + "/" + fileName);
-   }
+   impl->ensureLoaded();
 }
-void LingoDBTable::serialize(lingodb::utility::Serializer& serializer) const {
-   serializer.writeProperty(1, fileName);
-   serializer.writeProperty(2, sample);
-   auto res = arrow::ipc::SerializeSchema(*schema).ValueOrDie();
-   serializer.writeProperty(3, std::string_view((const char*) res->data(), res->size()));
-   serializer.writeProperty(4, columnStatistics);
-   serializer.writeProperty(5, numRows);
-}
-
-class BatchesWorkerResvState {
-   public:
-   size_t batchId;
-   std::mutex mutex;
-   bool hasMore{false};
-   size_t resvCursor{0};
-   size_t resvId{0};
-   size_t unitAmount;
-   // workerId steal task from
-   size_t stealWorkerId{std::numeric_limits<size_t>::max()};
-
-   int fetchAndNext() {
-      size_t cur;
-      {
-         std::lock_guard<std::mutex> stateLock(this->mutex);
-         cur = resvCursor;
-         resvCursor++;
-         hasMore = resvCursor < unitAmount;
-      }
-      if (cur >= unitAmount) {
-         return -1;
-      }
-      return cur;
-   }
-};
-
-class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
-   std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches;
-   std::vector<size_t> colIds;
-   std::function<void(lingodb::runtime::RecordBatchInfo*)> cb;
-   std::vector<lingodb::runtime::RecordBatchInfo*> batchInfos;
-   std::atomic<size_t> startIndex{0};
-   size_t splitSize{20000};
-   std::vector<std::unique_ptr<BatchesWorkerResvState>> workerResvs;
-
-   public:
-   ScanBatchesTask(std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds, const std::function<void(lingodb::runtime::RecordBatchInfo*)>& cb) : batches(batches), colIds(colIds), cb(cb) {
-      for (size_t i = 0; i < lingodb::scheduler::getNumWorkers(); i++) {
-         batchInfos.push_back(reinterpret_cast<lingodb::runtime::RecordBatchInfo*>(malloc(sizeof(lingodb::runtime::RecordBatchInfo) + sizeof(lingodb::runtime::ColumnInfo) * colIds.size())));
-         workerResvs.emplace_back(std::make_unique<BatchesWorkerResvState>());
-      }
-   }
-   void unitRun(size_t batchId, int unitId) {
-      auto& chunk = batches[batchId];
-      if (unitId < 0) {
-         return;
-      }
-      size_t begin = splitSize * unitId;
-      size_t len = std::min(begin + splitSize, chunk.getNumRows()) - begin;
-
-      auto* batchInfo = batchInfos[lingodb::scheduler::currentWorkerId()];
-      utility::Tracer::Trace trace(processMorsel);
-      access(colIds, batchInfo, chunk, begin, len);
-      cb(batchInfo);
-      trace.stop();
-   }
-
-   bool allocateWork() override {
-      // quick check for exhaust. workExhausted is true if there is no more buffer or no more
-      // work unit in own local state or steal from other workers.
-      if (workExhausted.load()) {
-         return false;
-      }
-
-      //1. if the current worker has more work locally, do it
-      auto* state = workerResvs[lingodb::scheduler::currentWorkerId()].get();
-      auto id = state->fetchAndNext();
-      if (id != -1) {
-         state->resvId = id;
-         return true;
-      }
-
-      //2. if the current worker has no more work locally, try to allocate new work
-      size_t localStartIndex = startIndex.fetch_add(1);
-      if (localStartIndex < batches.size()) {
-         auto& buffer = batches[localStartIndex];
-         auto unitAmount = (buffer.getNumRows() + splitSize - 1) / splitSize;
-         {
-            // reset local state
-            std::lock_guard<std::mutex> resetLock(state->mutex);
-            state->hasMore = true;
-            state->resvCursor = 1;
-            state->resvId = 0;
-            state->batchId = localStartIndex;
-            state->unitAmount = unitAmount;
-         }
-         return true;
-      }
-      //3. if the current worker has no more work locally and no more work globally, try to steal work from the worker we stole from last time
-      if (state->stealWorkerId != std::numeric_limits<size_t>::max()) {
-         auto* other = workerResvs[state->stealWorkerId].get();
-         if (other->hasMore) {
-            auto id = other->fetchAndNext();
-            if (id != -1) {
-               state->resvId = id;
-               return true;
-            }
-         }
-         state->stealWorkerId = std::numeric_limits<size_t>::max();
-      }
-      //4. if the current worker has no more work locally and no more work globally, try to steal work from other workers
-      for (size_t i = 1; i < workerResvs.size(); i++) {
-         // make sure index of worker to steal never exceed worker number limits
-         auto idx = (lingodb::scheduler::currentWorkerId() + i) % workerResvs.size();
-         auto* other = workerResvs[idx].get();
-         if (other->hasMore) {
-            auto id = other->fetchAndNext();
-            if (id != -1) {
-               // only current worker can modify its onw stealWorkerId. no need to lock
-               state->stealWorkerId = idx;
-               state->resvId = id;
-               return true;
-            }
-         }
-      }
-
-      workExhausted.store(true);
-      return false;
-   }
-   void performWork() override {
-      auto* state = workerResvs[lingodb::scheduler::currentWorkerId()].get();
-      if (state->stealWorkerId != std::numeric_limits<size_t>::max()) {
-         auto* other = workerResvs[state->stealWorkerId].get();
-         unitRun(other->batchId, state->resvId);
-         return;
-      }
-      unitRun(state->batchId, state->resvId);
-   }
-   ~ScanBatchesTask() {
-      utility::Tracer::Trace cleanUpTrace(cleanupTLS);
-      for (auto* bI : batchInfos) {
-         if (bI) {
-            free(bI);
-         }
-      }
-      cleanUpTrace.stop();
-   }
-};
-std::unique_ptr<LingoDBTable> LingoDBTable::deserialize(lingodb::utility::Deserializer& deserializer) {
-   auto fileName = deserializer.readProperty<std::string>(1);
-   auto sample = deserializer.readProperty<catalog::Sample>(2);
-   auto schemaData = deserializer.readProperty<std::string>(3);
-   arrow::ipc::DictionaryMemo dictMemo;
-   auto bufferReader = arrow::io::BufferReader::FromString(schemaData);
-   auto schema = arrow::ipc::ReadSchema(bufferReader.get(), &dictMemo).ValueOrDie();
-   auto columnStatistics = deserializer.readProperty<std::unordered_map<std::string, catalog::ColumnStatistics>>(4);
-   auto numRows = deserializer.readProperty<size_t>(5);
-   return std::make_unique<LingoDBTable>(fileName, schema, numRows, sample, columnStatistics);
-}
-
-class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplicitContext {
-   std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches;
-   std::vector<size_t> colIds;
-   std::function<void(lingodb::runtime::RecordBatchInfo*)> cb;
-
-   public:
-   ScanBatchesSingleThreadedTask(std::vector<lingodb::runtime::LingoDBTable::TableChunk>& batches, std::vector<size_t> colIds, const std::function<void(lingodb::runtime::RecordBatchInfo*)>& cb) : batches(batches), colIds(colIds), cb(cb) {
-   }
-
-   bool allocateWork() override {
-      if (!workExhausted.exchange(true)) {
-         return true;
-      }
-      return false;
-   }
-   void performWork() override {
-      auto* batchInfo = reinterpret_cast<lingodb::runtime::RecordBatchInfo*>(malloc(sizeof(lingodb::runtime::RecordBatchInfo) + sizeof(lingodb::runtime::ColumnInfo) * colIds.size()));
-
-      for (const auto& batch : batches) {
-         utility::Tracer::Trace trace(processMorselSingle);
-         access(colIds, batchInfo, batch);
-         cb(batchInfo);
-         trace.stop();
-      }
-      free(batchInfo);
-   }
-   ~ScanBatchesSingleThreadedTask() {
-   }
-};
 
 std::unique_ptr<scheduler::Task> LingoDBTable::createScanTask(const ScanConfig& scanConfig) {
-   ensureLoaded();
-   std::vector<size_t> colIds;
-   for (const auto& c : scanConfig.columns) {
-      auto colId = schema->GetFieldIndex(c);
-      assert(colId >= 0);
-      colIds.push_back(colId);
-   }
-   if (scanConfig.parallel) {
-      return std::make_unique<ScanBatchesTask>(tableData, colIds, scanConfig.cb);
-   } else {
-      return std::make_unique<ScanBatchesSingleThreadedTask>(tableData, colIds, scanConfig.cb);
-   }
+   return impl->createScanTask(scanConfig);
 }
 
-std::pair<const LingoDBTable::TableChunk*, size_t> LingoDBTable::getByRowId(size_t rowId) const {
-   auto res = std::upper_bound(tableData.begin(), tableData.end(), rowId, [](size_t rowId, const TableChunk& chunk) { return rowId < chunk.startRowId + chunk.numRows; });
-   if (res == tableData.end()) {
-      throw std::runtime_error("row id out of bounds");
-   }
-   auto& chunk = *res;
-   return {&chunk, rowId - chunk.startRowId};
+std::pair<const runtime::TableChunk*, size_t> LingoDBTable::getByRowId(size_t rowId) const {
+   auto [chunk, offset] = impl->getByRowId(rowId);
+   // Cast to the base interface type
+   return {static_cast<const runtime::TableChunk*>(chunk), offset};
 }
 
-size_t LingoDBTable::getColIndex(std::string colName) {
-   return schema->GetFieldIndex(colName);
+size_t LingoDBTable::getColIndex(const std::string& colName) {
+   return impl->getColIndex(colName);
+}
+
+void LingoDBTable::setPersist(bool shouldPersist) {
+   impl->setPersist(shouldPersist);
+}
+
+void LingoDBTable::setDBDir(const std::string& dbDir) {
+   impl->setDBDir(dbDir);
+}
+
+size_t LingoDBTable::getNumRows() const {
+   return impl->getNumRows();
+}
+
+const catalog::Sample& LingoDBTable::getSample() const {
+   return impl->getSample();
+}
+
+// Serialization methods
+std::unique_ptr<LingoDBTable> LingoDBTable::deserialize(utility::Deserializer& deserializer) {
+   std::string fileName = deserializer.readProperty<std::string>(1);
+   std::string schema_blob = deserializer.readProperty<std::string>(2);
+   auto buffer = std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(schema_blob.data()), schema_blob.size());
+   arrow::io::BufferReader reader(buffer);
+   auto result = arrow::ipc::ReadSchema(&reader, nullptr);
+   if (!result.ok()) throw std::runtime_error(result.status().ToString());
+   std::shared_ptr<arrow::Schema> schema = result.ValueOrDie();
+   return std::make_unique<LingoDBTable>(fileName, schema);
 }
 
 } // namespace lingodb::runtime

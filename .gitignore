@@ -2,6 +2,8 @@
 build/
 test*.mlir
 test.sql
+resources/data/uni
+resources/data/test
 resources/data/tpch-*
 resources/data/tpcds-*
 resources/data/job
@@ -22,3 +24,4 @@ operations.parquet
 .vscode
 mlir_venv
 venv
+

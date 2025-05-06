@@ -43,9 +43,8 @@ void LingoDBTableCatalogEntry::serializeEntry(lingodb::utility::Serializer& seri
    }
    serializer.writeProperty(8, primaryKey);
    serializer.writeProperty(9, indices);
-
-   serializer.writeProperty(10, impl);
 }
+
 std::shared_ptr<LingoDBTableCatalogEntry> LingoDBTableCatalogEntry::deserialize(lingodb::utility::Deserializer& deserializer) {
    auto name = deserializer.readProperty<std::string>(2);
    auto numColumns = deserializer.readProperty<size_t>(3);
@@ -56,7 +55,10 @@ std::shared_ptr<LingoDBTableCatalogEntry> LingoDBTableCatalogEntry::deserialize(
    }
    auto primaryKey = deserializer.readProperty<std::vector<std::string>>(8);
    auto indices = deserializer.readProperty<std::vector<std::string>>(9);
-   auto rawTable = deserializer.readProperty<std::unique_ptr<lingodb::runtime::LingoDBTable>>(10);
+   
+   // Deserialize the impl using LingoDBTable's deserialization method
+   auto rawTable = runtime::LingoDBTable::deserialize(deserializer);
+   
    return std::make_shared<LingoDBTableCatalogEntry>(name, columns, primaryKey, indices, std::move(rawTable));
 }
 

@@ -157,14 +157,16 @@ void HashIndexIteration::consumeRecordBatch(lingodb::runtime::RecordBatchInfo* i
    for (size_t i = 0; i != access.colIds.size(); ++i) {
       auto colId = access.colIds[i];
       auto* colInfo = &info->columnInfo[i];
-      std::memcpy(colInfo, &tableChunk->getColumnInfo(colId), sizeof(ColumnInfo));
+      // Copy column info directly from the record batch
+      *colInfo = RecordBatchInfo::getColumnInfo(colId, tableChunk->data());
       colInfo->offset += offset;
    }
    current = current->next;
 }
 HashIndexAccess::HashIndexAccess(lingodb::runtime::LingoDBHashIndex& hashIndex, std::vector<std::string> cols) : hashIndex(hashIndex) {
    for (const auto& c : cols) {
-      colIds.push_back(dynamic_cast<LingoDBTable*>(&hashIndex.table->getTableStorage())->getColIndex(c));
+      // Use the TableStorage interface directly instead of dynamic_cast
+      colIds.push_back(hashIndex.table->getTableStorage().getColIndex(c));
    }
    for (auto i = 0ull; i < lingodb::scheduler::getNumWorkers(); i++) {
       iteration.push_back(HashIndexIteration(*this, 0, nullptr));
