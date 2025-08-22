@@ -61,20 +61,24 @@ void Catalog::persist() {
    }
 }
 std::shared_ptr<Catalog> Catalog::create(std::string dbDir, bool eagerLoading) {
-   if (!std::filesystem::exists(dbDir)) {
-      std::filesystem::create_directories(dbDir);
+   // Normalize the path to absolute to avoid creating files in unexpected locations
+   std::filesystem::path normalizedPath = std::filesystem::absolute(dbDir);
+   std::string absolutePath = normalizedPath.string();
+   
+   if (!std::filesystem::exists(absolutePath)) {
+      std::filesystem::create_directories(absolutePath);
    }
-   if (!std::filesystem::exists(dbDir + "/db.lingodb")) {
+   if (!std::filesystem::exists(absolutePath + "/db.lingodb")) {
       auto res = std::make_shared<Catalog>();
-      res->dbDir = dbDir;
+      res->dbDir = absolutePath;
       return res;
    } else {
-      lingodb::utility::FileByteReader reader(dbDir + "/db.lingodb");
+      lingodb::utility::FileByteReader reader(absolutePath + "/db.lingodb");
       lingodb::utility::Deserializer deserializer(reader);
       auto res = std::make_shared<Catalog>(deserializer.readProperty<Catalog>(0));
-      res->dbDir = dbDir;
+      res->dbDir = absolutePath;
       for (auto& entry : res->entries) {
-         entry.second->setDBDir(dbDir);
+         entry.second->setDBDir(absolutePath);
          entry.second->setCatalog(&*res);
       }
       if (eagerLoading) {
