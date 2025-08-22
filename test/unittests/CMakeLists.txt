@@ -11,6 +11,8 @@ add_executable(tester
         catalog/TestRocksDBDeserialization.cpp
         catalog/TestRocksDBCatalogEdgeCases.cpp
         catalog/TestRocksDBCatalogComprehensive.cpp
+        catalog/TestRocksDBConcurrency.cpp
+        catalog/TestRocksDBErrorHandling.cpp
         runtime/TestUTF8.cpp
         runtime/TestRocksDBRelationHelper.cpp
         storage/TestStorage.cpp

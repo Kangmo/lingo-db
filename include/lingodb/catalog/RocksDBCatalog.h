@@ -6,6 +6,8 @@
 #include "Catalog.h"
 #include "lingodb/runtime/storage/RocksDBStorage.h"
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -27,6 +29,15 @@ class RocksDBCatalog : public Catalog {
 public:
     RocksDBCatalog();
     explicit RocksDBCatalog(std::shared_ptr<lingodb::runtime::RocksDBStorage> storage);
+    
+    // Move constructor and move assignment operator
+    RocksDBCatalog(RocksDBCatalog&& other) noexcept;
+    RocksDBCatalog& operator=(RocksDBCatalog&& other) noexcept;
+    
+    // Delete copy constructor and copy assignment operator
+    RocksDBCatalog(const RocksDBCatalog&) = delete;
+    RocksDBCatalog& operator=(const RocksDBCatalog&) = delete;
+    
     void serialize(lingodb::utility::Serializer& serializer) const;
     static RocksDBCatalog deserialize(lingodb::utility::Deserializer& deSerializer);
 
@@ -63,7 +74,8 @@ public:
     ~RocksDBCatalog();
 
 private:
-    // In-memory cache of catalog entries for performance
+    // Thread-safe in-memory cache of catalog entries for performance
+    mutable std::shared_mutex cacheMutex;
     mutable std::unordered_map<std::string, std::shared_ptr<CatalogEntry>> entryCache;
     mutable bool cacheValid = false;
     

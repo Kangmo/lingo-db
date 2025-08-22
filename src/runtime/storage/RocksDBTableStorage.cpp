@@ -102,12 +102,10 @@ std::shared_ptr<arrow::DataType> toPhysicalType(lingodb::catalog::Type t) {
       }
       case TypeId::CHAR: {
          auto charInfo = t.getInfo<lingodb::catalog::CharTypeInfo>();
-         // char(1) is stored as fixed_size_binary(4) for UTF-8 compatibility
-         // other char types are stored as strings
          size_t length = charInfo->getLength();
-         if (length == 1) {
-            return arrow::fixed_size_binary(4);
-         }
+         // Store all CHAR types as UTF-8 strings for consistency
+         // This avoids issues with fixed_size_binary conversion
+         // and ensures proper UTF-8 handling
          return arrow::utf8();
       }
          break;

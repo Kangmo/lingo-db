@@ -27,8 +27,36 @@ RocksDBCatalog::RocksDBCatalog(std::shared_ptr<lingodb::runtime::RocksDBStorage>
     }
 }
 
+RocksDBCatalog::RocksDBCatalog(RocksDBCatalog&& other) noexcept
+    : Catalog(std::move(other)),
+      storage(std::move(other.storage)),
+      entryCache(std::move(other.entryCache)),
+      cacheValid(other.cacheValid) {
+    other.cacheValid = false;
+}
+
+RocksDBCatalog& RocksDBCatalog::operator=(RocksDBCatalog&& other) noexcept {
+    if (this != &other) {
+        Catalog::operator=(std::move(other));
+        storage = std::move(other.storage);
+        entryCache = std::move(other.entryCache);
+        cacheValid = other.cacheValid;
+        other.cacheValid = false;
+    }
+    return *this;
+}
+
 RocksDBCatalog::~RocksDBCatalog() {
-    persist();
+    // Don't throw exceptions from destructor
+    try {
+        persist();
+    } catch (const std::exception& e) {
+        // Log error but don't propagate
+        std::cerr << "Error during RocksDBCatalog destruction: " << e.what() << std::endl;
+    } catch (...) {
+        // Catch any other exceptions
+        std::cerr << "Unknown error during RocksDBCatalog destruction" << std::endl;
+    }
 }
 
 void RocksDBCatalog::serialize(lingodb::utility::Serializer& serializer) const {
@@ -37,6 +65,9 @@ void RocksDBCatalog::serialize(lingodb::utility::Serializer& serializer) const {
     // We don't serialize all entries here since they're stored individually in RocksDB
     // Just serialize the count for compatibility
     loadAllEntries();
+    
+    // Read lock to access cache size
+    std::shared_lock<std::shared_mutex> lock(cacheMutex);
     serializer.writeProperty(1, entryCache.size());
 }
 
@@ -49,7 +80,7 @@ RocksDBCatalog RocksDBCatalog::deserialize(lingodb::utility::Deserializer& deser
     RocksDBCatalog res;
     // Entries will be loaded lazily from RocksDB
     (void)deserializer.readProperty<size_t>(1); // Read but don't use
-    return res;
+    return std::move(res);
 }
 
 std::optional<std::shared_ptr<CatalogEntry>> RocksDBCatalog::getEntry(std::string name) {
@@ -58,24 +89,32 @@ std::optional<std::shared_ptr<CatalogEntry>> RocksDBCatalog::getEntry(std::strin
         return std::nullopt;
     }
     
-    // Check cache first
-    if (cacheValid && entryCache.contains(name)) {
-        return entryCache.at(name);
+    // Check cache first with read lock
+    {
+        std::shared_lock<std::shared_mutex> lock(cacheMutex);
+        if (cacheValid && entryCache.contains(name)) {
+            return entryCache.at(name);
+        }
     }
-    
     
     // Load from RocksDB
     if (entryExists(name)) {
         try {
             auto entry = loadEntry(name);
             if (entry) {
+                // Upgrade to write lock to update cache
+                std::unique_lock<std::shared_mutex> lock(cacheMutex);
                 entryCache[name] = entry;
                 return entry;
             } else {
+                // Log error: entry exists but failed to load
+                std::cerr << "Warning: Entry '" << name << "' exists but failed to load\n";
             }
         } catch (const std::exception& e) {
+            // Log error and propagate
+            std::cerr << "Error loading entry '" << name << "': " << e.what() << "\n";
+            throw;
         }
-    } else {
     }
     
     return std::nullopt;
@@ -86,16 +125,31 @@ void RocksDBCatalog::persist() {
         return;
     }
     
-    // Persist all cached entries
-    for (const auto& [name, entry] : entryCache) {
-        entry->flush();
-        storeEntry(name, entry);
-    }
-    
-    // Flush the catalog column family
-    auto status = storage->flush(lingodb::runtime::RocksDBStorage::ColumnFamily::CATALOG);
-    if (!status.ok()) {
-        throw std::runtime_error("Failed to flush catalog: " + status.ToString());
+    try {
+        // Persist all cached entries with read lock
+        std::shared_lock<std::shared_mutex> lock(cacheMutex);
+        for (const auto& [name, entry] : entryCache) {
+            try {
+                entry->flush();
+                storeEntry(name, entry);
+            } catch (const std::exception& e) {
+                // Log but continue with other entries
+                std::cerr << "Failed to persist entry " << name << ": " << e.what() << std::endl;
+            }
+        }
+        
+        // Flush the catalog column family
+        auto status = storage->flush(lingodb::runtime::RocksDBStorage::ColumnFamily::CATALOG);
+        if (!status.ok()) {
+            throw std::runtime_error("Failed to flush catalog: " + status.ToString());
+        }
+    } catch (const std::exception& e) {
+        // Re-throw if not called from destructor
+        if (std::uncaught_exceptions() == 0) {
+            throw;
+        }
+        // Otherwise just log the error
+        std::cerr << "Error during persist (in destructor context): " << e.what() << std::endl;
     }
 }
 
@@ -115,7 +169,15 @@ void RocksDBCatalog::insertEntry(std::shared_ptr<CatalogEntry> entry) {
     
     std::string name = entry->getName();
     
-    if (entryCache.contains(name) || entryExists(name)) {
+    // Check existence with read lock, then upgrade to write if needed
+    {
+        std::shared_lock<std::shared_mutex> lock(cacheMutex);
+        if (entryCache.contains(name)) {
+            throw std::runtime_error("catalog entry already exists: " + name);
+        }
+    }
+    
+    if (entryExists(name)) {
         throw std::runtime_error("catalog entry already exists: " + name);
     }
     
@@ -124,8 +186,11 @@ void RocksDBCatalog::insertEntry(std::shared_ptr<CatalogEntry> entry) {
     entry->setDBDir(dbDir);
     entry->setShouldPersist(shouldPersist);
     
-    // Cache the entry
-    entryCache[name] = entry;
+    // Cache the entry with write lock
+    {
+        std::unique_lock<std::shared_mutex> lock(cacheMutex);
+        entryCache[name] = entry;
+    }
     
     // Store in RocksDB
     if (storage) {
@@ -337,26 +402,37 @@ std::shared_ptr<CatalogEntry> RocksDBCatalog::deserializeEntry(const std::string
 }
 
 void RocksDBCatalog::loadAllEntries() const {
-    if (cacheValid || !storage) {
-        return;
+    // Check if already loaded with read lock
+    {
+        std::shared_lock<std::shared_mutex> lock(cacheMutex);
+        if (cacheValid || !storage) {
+            return;
+        }
     }
     
-    entryCache.clear();
+    // Load entries from storage
     auto entryNames = getAllEntryNames();
+    std::unordered_map<std::string, std::shared_ptr<CatalogEntry>> newCache;
     
     for (const std::string& name : entryNames) {
         auto entry = loadEntry(name);
         if (entry) {
-            entryCache[name] = entry;
             entry->setDBDir(dbDir);
             entry->setCatalog(const_cast<Catalog*>(reinterpret_cast<const Catalog*>(this)));
+            newCache[name] = entry;
         }
     }
     
-    cacheValid = true;
+    // Update cache atomically with write lock
+    {
+        std::unique_lock<std::shared_mutex> lock(cacheMutex);
+        entryCache = std::move(newCache);
+        cacheValid = true;
+    }
 }
 
 void RocksDBCatalog::invalidateCache() const {
+    std::unique_lock<std::shared_mutex> lock(cacheMutex);
     cacheValid = false;
     entryCache.clear();
 }

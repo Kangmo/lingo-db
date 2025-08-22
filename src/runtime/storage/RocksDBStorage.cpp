@@ -7,6 +7,7 @@
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 
 namespace lingodb::runtime {
@@ -80,18 +81,32 @@ rocksdb::Status RocksDBStorage::close() {
         return rocksdb::Status::OK();
     }
     
-    // Close column family handles
-    for (auto* handle : column_families) {
-        delete handle;
+    // RAII: Close column family handles safely
+    // Store status before cleanup to return it
+    rocksdb::Status closeStatus = rocksdb::Status::OK();
+    
+    try {
+        // Close column family handles
+        for (auto* handle : column_families) {
+            if (handle) {
+                delete handle;
+            }
+        }
+        column_families.clear();
+        
+        // Close database
+        if (db) {
+            closeStatus = db->Close();
+            db.reset();
+        }
+    } catch (const std::exception& e) {
+        // Log but don't throw from cleanup
+        std::cerr << "Error during RocksDBStorage close: " << e.what() << std::endl;
+        closeStatus = rocksdb::Status::IOError("Exception during close: " + std::string(e.what()));
     }
-    column_families.clear();
     
-    // Close database
-    rocksdb::Status status = db->Close();
-    db.reset();
     opened = false;
-    
-    return status;
+    return closeStatus;
 }
 
 rocksdb::Status RocksDBStorage::put(ColumnFamily cf, const std::string& key, const std::string& value) {
