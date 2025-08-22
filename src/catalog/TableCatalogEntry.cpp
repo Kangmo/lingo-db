@@ -3,6 +3,9 @@
 #include "lingodb/catalog/Defs.h"
 #include "lingodb/catalog/IndexCatalogEntry.h"
 #include "lingodb/runtime/storage/LingoDBTable.h"
+#ifdef WITH_ROCKSDB
+#include "lingodb/runtime/storage/RocksDBTableStorage.h"
+#endif
 #include "lingodb/utility/Serialization.h"
 
 #include <cassert>
@@ -79,4 +82,88 @@ size_t LingoDBTableCatalogEntry::getNumRows() const {
 const Sample& LingoDBTableCatalogEntry::getSample() const {
    return impl->getSample();
 }
+
+#ifdef WITH_ROCKSDB
+// RocksDBTableCatalogEntry implementation
+RocksDBTableCatalogEntry::RocksDBTableCatalogEntry(std::string name, std::vector<Column> columns, 
+                                                  std::vector<std::string> primaryKey, std::vector<std::string> indices, 
+                                                  std::unique_ptr<runtime::RocksDBTableStorage> impl,
+                                                  std::shared_ptr<runtime::RocksDBStorage> storage) 
+    : TableCatalogEntry(CatalogEntryType::LINGODB_TABLE_ENTRY, name, columns, primaryKey, indices), 
+      impl(std::move(impl)), storage(storage) {}
+
+void RocksDBTableCatalogEntry::flush() {
+   impl->flush();
+}
+
+void RocksDBTableCatalogEntry::setShouldPersist(bool shouldPersist) {
+   // RocksDB always persists, but we can control flushing behavior
+   // For now, we'll just mark the storage as persistent
+}
+
+void RocksDBTableCatalogEntry::setDBDir(std::string dbDir) {
+   // RocksDB storage is already initialized with the directory
+   // This is called for compatibility with the existing interface
+}
+
+void RocksDBTableCatalogEntry::ensureFullyLoaded() {
+   impl->ensureLoaded();
+}
+
+runtime::TableStorage& RocksDBTableCatalogEntry::getTableStorage() {
+   return *impl;
+}
+
+void RocksDBTableCatalogEntry::serializeEntry(lingodb::utility::Serializer& serializer) const {
+   serializer.writeProperty(2, name);
+   serializer.writeProperty(3, columns.size());
+   for (const auto& column : columns) {
+      serializer.writeProperty(4, column);
+   }
+   serializer.writeProperty(8, primaryKey);
+   serializer.writeProperty(9, indices);
+   
+   // For RocksDB, we don't serialize the storage implementation directly
+   // since it's managed by the RocksDB instance
+   serializer.writeProperty(10, name); // Store table name for reconstruction
+}
+
+std::shared_ptr<RocksDBTableCatalogEntry> RocksDBTableCatalogEntry::deserialize(lingodb::utility::Deserializer& deserializer) {
+   auto name = deserializer.readProperty<std::string>(2);
+   auto columnCount = deserializer.readProperty<size_t>(3);
+   std::vector<Column> columns;
+   for (size_t i = 0; i < columnCount; i++) {
+      columns.push_back(deserializer.readProperty<Column>(4));
+   }
+   auto primaryKey = deserializer.readProperty<std::vector<std::string>>(8);
+   auto indices = deserializer.readProperty<std::vector<std::string>>(9);
+   auto tableName = deserializer.readProperty<std::string>(10);
+   
+   // Note: This method can't fully reconstruct the RocksDB storage
+   // It should be called by RocksDBCatalog which will provide the storage instance
+   // For now, return a placeholder that will be properly initialized later
+   return nullptr; // Will be handled by RocksDBCatalog
+}
+
+const Sample& RocksDBTableCatalogEntry::getSample() const {
+   return impl->getSample();
+}
+
+const ColumnStatistics& RocksDBTableCatalogEntry::getColumnStatistics(std::string_view column) const {
+   return impl->getColumnStatistics(column);
+}
+
+size_t RocksDBTableCatalogEntry::getNumRows() const {
+   return impl->getNumRows();
+}
+
+std::shared_ptr<RocksDBTableCatalogEntry> RocksDBTableCatalogEntry::createFromCreateTable(const CreateTableDef& def, 
+                                                                                          std::shared_ptr<runtime::RocksDBStorage> storage) {
+   auto impl = runtime::RocksDBTableStorage::create(storage, def);
+   auto res = std::make_shared<RocksDBTableCatalogEntry>(def.name, def.columns, def.primaryKey, 
+                                                        std::vector<std::string>{}, std::move(impl), storage);
+   return res;
+}
+#endif // WITH_ROCKSDB
+
 } // namespace lingodb::catalog

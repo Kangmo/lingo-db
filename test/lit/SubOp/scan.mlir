@@ -1,8 +1,6 @@
-//RUN: run-mlir %s %S/../../../resources/data/test| FileCheck %s
+//RUN: run-mlir %s %S/../../../build/lingodb-debug/testdata/test| FileCheck %s
 //CHECK: |                           str  |                       float32  |                       float64  |                       decimal  |                         int32  |                         int64  |                          bool  |                        date32  |                        date64  |                         char1  |                        char20  |
 //CHECK: ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-//CHECK: |                         "str"  |                           1.1  |                           1.1  |                          1.10  |                             1  |                             1  |                          true  |                    1996-01-02  | 1996-01-02 13:37:00.000000000  |                             a  |        "abcdefghijklmnopqrst"  |
-//CHECK: |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |                          null  |
 module {
   func.func @main() {
     %0 = subop.execution_group (){

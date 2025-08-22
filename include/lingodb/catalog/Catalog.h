@@ -5,6 +5,14 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+
+// Forward declarations
+#ifdef WITH_ROCKSDB
+namespace lingodb::runtime {
+class RocksDBStorage;
+}
+#endif
+
 namespace lingodb::utility {
 class Serializer;
 class Deserializer;
@@ -40,6 +48,8 @@ class CatalogEntry {
 
 class Catalog {
    static constexpr size_t binaryVersion = 2;
+   
+   protected:
    bool shouldPersist;
    std::string dbDir;
 
@@ -49,7 +59,15 @@ class Catalog {
    void serialize(lingodb::utility::Serializer& serializer) const;
    static Catalog deserialize(lingodb::utility::Deserializer& deSerializer);
 
-   std::optional<std::shared_ptr<CatalogEntry>> getEntry(std::string name) {
+   // Virtual method to detect RocksDB support
+   virtual bool hasRocksDBSupport() const { return false; }
+   
+#ifdef WITH_ROCKSDB
+   // Virtual method to get RocksDB storage (only for RocksDBCatalog)
+   virtual std::shared_ptr<lingodb::runtime::RocksDBStorage> getRocksDBStorage() const { return nullptr; }
+#endif
+
+   virtual std::optional<std::shared_ptr<CatalogEntry>> getEntry(std::string name) {
       if (entries.contains(name)) {
          return entries.at(name);
       } else {
@@ -58,19 +76,20 @@ class Catalog {
    }
    template <class T>
    std::optional<std::shared_ptr<T>> getTypedEntry(std::string name) {
-      if (entries.contains(name)) {
-         auto entry = entries.at(name);
+      auto entry = getEntry(name);
+      if (entry.has_value()) {
          for (auto x : T::entryTypes) {
-            if (entry->getEntryType() == x) {
-               return std::static_pointer_cast<T>(entry);
+            if (entry.value()->getEntryType() == x) {
+               return std::static_pointer_cast<T>(entry.value());
             }
          }
-         return std::nullopt;
-      } else {
-         return std::nullopt;
       }
+      return std::nullopt;
    }
-   void persist();
+   static std::shared_ptr<Catalog> createEmpty();
+   static std::shared_ptr<Catalog> create(std::string dbDir, bool eagerLoading = false);
+
+   virtual void persist();
    void setShouldPersist(bool shouldPersist) {
       this->shouldPersist = shouldPersist;
       for (auto& entry : entries) {
@@ -78,10 +97,8 @@ class Catalog {
       }
    }
 
-   void insertEntry(std::shared_ptr<CatalogEntry> entry);
-   static std::shared_ptr<Catalog> create(std::string dbDir, bool eagerLoading);
-   static std::shared_ptr<Catalog> createEmpty();
-   ~Catalog() {
+   virtual void insertEntry(std::shared_ptr<CatalogEntry> entry);
+   virtual ~Catalog() {
       persist();
    }
 

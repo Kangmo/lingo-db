@@ -52,6 +52,8 @@ int main(int argc, char** argv) {
    }
 
    auto session = runtime::Session::createSession(std::string(argv[1]), true);
+   // Enable persistence for the catalog
+   session->getCatalog()->setShouldPersist(true);
 
    lingodb::compiler::support::eval::init();
    auto scheduler = scheduler::startScheduler();
@@ -77,6 +79,9 @@ int main(int argc, char** argv) {
       }
       handleQuery(*session, query.str(), reportTimes);
    }
+
+   // Persist the catalog before exiting
+   session->getCatalog()->persist();
 
    return 0;
 }

@@ -15,13 +15,37 @@
 #include <lingodb/catalog/Defs.h>
 
 #include <lingodb/runtime/storage/LingoDBTable.h>
+#ifdef WITH_ROCKSDB
+#include "lingodb/catalog/RocksDBCatalog.h"
+#endif
+
 namespace lingodb::runtime {
 void RelationHelper::createTable(lingodb::runtime::VarLen32 meta) {
    auto* context = getCurrentExecutionContext();
    auto& session = context->getSession();
    auto catalog = session.getCatalog();
    auto def = utility::deserializeFromHexString<lingodb::catalog::CreateTableDef>(meta.str());
-   auto relation = lingodb::catalog::LingoDBTableCatalogEntry::createFromCreateTable(def);
+   
+   std::shared_ptr<lingodb::catalog::TableCatalogEntry> relation;
+   
+#ifdef WITH_ROCKSDB
+   // Use RocksDB table catalog entry if the catalog supports RocksDB
+   if (catalog->hasRocksDBSupport()) {
+      auto rocksStorage = catalog->getRocksDBStorage();
+      if (rocksStorage) {
+         relation = lingodb::catalog::RocksDBTableCatalogEntry::createFromCreateTable(def, rocksStorage);
+      } else {
+         // Fallback if getRocksDBStorage returns null
+         relation = lingodb::catalog::LingoDBTableCatalogEntry::createFromCreateTable(def);
+      }
+   } else {
+      relation = lingodb::catalog::LingoDBTableCatalogEntry::createFromCreateTable(def);
+   }
+#else
+   // Use original implementation when RocksDB is not available
+   relation = lingodb::catalog::LingoDBTableCatalogEntry::createFromCreateTable(def);
+#endif
+   
    catalog->insertEntry(relation);
    if (!def.primaryKey.empty()) {
       auto index = lingodb::catalog::LingoDBHashIndexEntry::createForPrimaryKey(def.name, def.primaryKey);

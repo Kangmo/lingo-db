@@ -21,7 +21,7 @@ class Sample {
    std::shared_ptr<arrow::RecordBatch> getSampleData() const { return sampleData; }
    void serialize(utility::Serializer& serializer) const;
    static Sample deserialize(utility::Deserializer& deserializer);
-   operator bool() {
+   operator bool() const {
       return !!sampleData;
    }
 };

@@ -1,4 +1,4 @@
-set persist=1;
+
 create table test(
     str varchar(20),
     float32 float(2),

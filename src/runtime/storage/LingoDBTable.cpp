@@ -149,7 +149,10 @@ std::shared_ptr<arrow::DataType> toPhysicalType(lingodb::catalog::Type t) {
                return arrow::date32();
             case lingodb::catalog::DateTypeInfo::DateUnit::MILLIS:
                return arrow::date64();
+            default:
+               return arrow::date32(); // Default to date32
          }
+         break;
       }
       case TypeId::TIMESTAMP: {
          arrow::TimeUnit::type timeUnit;
@@ -167,8 +170,12 @@ std::shared_ptr<arrow::DataType> toPhysicalType(lingodb::catalog::Type t) {
             case lingodb::catalog::TimestampTypeInfo::TimestampUnit::SECONDS:
                timeUnit = arrow::TimeUnit::SECOND;
                break;
+            default:
+               timeUnit = arrow::TimeUnit::MICRO; // Default to micro
+               break;
          }
          return arrow::timestamp(timeUnit);
+         break;
       }
       case TypeId::INTERVAL: {
          auto intervalUnit = t.getInfo<lingodb::catalog::IntervalTypeInfo>()->getUnit();
@@ -177,16 +184,28 @@ std::shared_ptr<arrow::DataType> toPhysicalType(lingodb::catalog::Type t) {
                return arrow::day_time_interval();
             case lingodb::catalog::IntervalTypeInfo::IntervalUnit::MONTH:
                return arrow::month_interval();
+            default:
+               return arrow::day_time_interval(); // Default to day_time_interval
          }
+         break;
       }
       case TypeId::CHAR: {
-         if (t.getInfo<lingodb::catalog::CharTypeInfo>()->getLength() == 1) {
-            return arrow::fixed_size_binary(4);
+         auto charInfo = t.getInfo<lingodb::catalog::CharTypeInfo>();
+         if (charInfo) {
+            // char(1) is stored as fixed_size_binary(4) for UTF-8 compatibility
+            // other char types are stored as strings
+            size_t length = charInfo->getLength();
+            if (length == 1) {
+               return arrow::fixed_size_binary(4);
+            }
+            return arrow::utf8();
          }
          return arrow::utf8();
+         break;
       }
       case TypeId::STRING:
          return arrow::utf8();
+         break;
       default:
          throw std::runtime_error("unsupported type");
    }

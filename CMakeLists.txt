@@ -35,6 +35,14 @@ message("Using ZLIB: ${ZLIB_INCLUDE_DIRS}")
 message("Using Python3: ${Python3_EXECUTABLE}")
 
 find_package(Arrow 20 REQUIRED)
+find_package(RocksDB QUIET)
+
+if(RocksDB_FOUND)
+    message(STATUS "RocksDB found - enabling RocksDB storage backend")
+    add_definitions(-DWITH_ROCKSDB)
+else()
+    message(WARNING "RocksDB not found - RocksDB storage backend will be disabled")
+endif()
 
 option(ENABLE_GPU_BACKEND "enable GPU backend" OFF)
 option(ENABLE_TESTS "enable tests" ON)

@@ -55,10 +55,14 @@ void printMLIR(std::string sql, std::shared_ptr<lingodb::catalog::Catalog> catal
 } // end namespace
 int main(int argc, char** argv) {
    std::string filename = std::string(argv[1]);
-   auto catalog = lingodb::catalog::Catalog::createEmpty();
+   std::shared_ptr<lingodb::catalog::Catalog> catalog;
    if (argc >= 3) {
       std::string dbDir = std::string(argv[2]);
-      catalog = lingodb::catalog::Catalog::create(dbDir, false);
+      // Use Session::createSession like other tools to properly handle RocksDB
+      auto session = lingodb::runtime::Session::createSession(dbDir, true); // eagerLoading=true
+      catalog = session->getCatalog();
+   } else {
+      catalog = lingodb::catalog::Catalog::createEmpty();
    }
    std::ifstream istream{filename};
    std::stringstream buffer;

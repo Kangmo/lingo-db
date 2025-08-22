@@ -43,8 +43,18 @@ else ()
     list(APPEND COMPILE_DEFS "GPU_ENABLED=0")
 endif (ENABLE_GPU_BACKEND)
 
+if(RocksDB_FOUND)
+    target_sources(runtime PRIVATE
+        storage/RocksDBStorage.cpp
+        storage/RocksDBTableStorage.cpp
+    )
+endif()
+
 target_compile_definitions(runtime PUBLIC ${COMPILE_DEFS})
 target_link_libraries(runtime PRIVATE Arrow::arrow_static)
+if(RocksDB_FOUND)
+    target_link_libraries(runtime PRIVATE RocksDB::rocksdb)
+endif()
 
 add_subdirectory(GPU)
 target_link_libraries(runtime PUBLIC GPU-rt scheduler)

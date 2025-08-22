@@ -1,4 +1,4 @@
---// RUN: sql-to-mlir %s %S/../../../resources/data/test | FileCheck %s
+--// RUN: sql-to-mlir %s %S/../../../build/lingodb-debug/testdata/test | FileCheck %s
 --//CHECK: module {
 --//CHECK:     func.func @main() {
 --//CHECK:         %{{.*}} = relalg.const_relation columns : [@dummyScope::@dummyName({type = i32})] values :

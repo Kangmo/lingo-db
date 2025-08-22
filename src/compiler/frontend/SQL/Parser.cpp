@@ -1552,10 +1552,13 @@ void frontend::sql::Parser::translateInsertStmt(mlir::OpBuilder& builder, Insert
       std::vector<mlir::Attribute> colTypes;
       auto& memberManager = builder.getContext()->getLoadedDialect<subop::SubOperatorDialect>()->getMemberManager();
       for (auto x : rel->getColumnNames()) {
-         colMemberNames.push_back(builder.getStringAttr(memberManager.getUniqueMember(x)));
-         orderedColNamesAttrs.push_back(builder.getStringAttr(x));
-         orderedColAttrs.push_back(insertedCols.at(x));
-         colTypes.push_back(mlir::TypeAttr::get(mlir::cast<tuples::ColumnRefAttr>(insertedCols.at(x)).getColumn().type));
+         // Only process columns that were actually inserted to avoid crash
+         if (insertedCols.find(x) != insertedCols.end()) {
+            colMemberNames.push_back(builder.getStringAttr(memberManager.getUniqueMember(x)));
+            orderedColNamesAttrs.push_back(builder.getStringAttr(x));
+            orderedColAttrs.push_back(insertedCols.at(x));
+            colTypes.push_back(mlir::TypeAttr::get(mlir::cast<tuples::ColumnRefAttr>(insertedCols.at(x)).getColumn().type));
+         }
       }
       localTableType = subop::LocalTableType::get(builder.getContext(), subop::StateMembersAttr::get(builder.getContext(), builder.getArrayAttr(colMemberNames), builder.getArrayAttr(colTypes)), builder.getArrayAttr(orderedColNamesAttrs));
       mlir::Value newRows = builder.create<relalg::MaterializeOp>(builder.getUnknownLoc(), localTableType, mapOp.getResult(), builder.getArrayAttr(orderedColAttrs), builder.getArrayAttr(orderedColNamesAttrs));

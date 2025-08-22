@@ -7,8 +7,17 @@ add_executable(tester
         catalog/TestTypes.cpp
         catalog/TestMetaData.cpp
         catalog/TestCatalogEntries.cpp
+        catalog/TestRocksDBIntegration.cpp
+        catalog/TestRocksDBDeserialization.cpp
+        catalog/TestRocksDBCatalogEdgeCases.cpp
+        catalog/TestRocksDBCatalogComprehensive.cpp
         runtime/TestUTF8.cpp
+        runtime/TestRocksDBRelationHelper.cpp
         storage/TestStorage.cpp
+        storage/TestRocksDBStorage.cpp
+        storage/TestRocksDBTableStorage.cpp
+        storage/TestRocksDBStorageComprehensive.cpp
+        storage/TestRocksDBTableStorageComprehensive.cpp
         utility/TestSerialization.cpp
 )
 target_link_libraries(tester PRIVATE Catch2::Catch2WithMain ${LIBS} utility catalog MLIRSQLFrontend runtime runner)

@@ -10,6 +10,10 @@
 #include <arrow/type_fwd.h>
 namespace lingodb::runtime {
 class LingoDBTable;
+#ifdef WITH_ROCKSDB
+class RocksDBTableStorage;
+class RocksDBStorage;
+#endif
 class TableStorage;
 } // namespace lingodb::runtime
 namespace lingodb::catalog {
@@ -61,6 +65,34 @@ class LingoDBTableCatalogEntry : public TableCatalogEntry {
    virtual void setDBDir(std::string dbDir) override;
    static std::shared_ptr<LingoDBTableCatalogEntry> createFromCreateTable(const CreateTableDef& def);
 };
+
+#ifdef WITH_ROCKSDB
+class RocksDBTableCatalogEntry : public TableCatalogEntry {
+   std::unique_ptr<runtime::RocksDBTableStorage> impl;
+   std::shared_ptr<runtime::RocksDBStorage> storage;
+
+   public:
+   RocksDBTableCatalogEntry(std::string name, std::vector<Column> columns, std::vector<std::string> primaryKey, 
+                           std::vector<std::string> indices, std::unique_ptr<runtime::RocksDBTableStorage> impl,
+                           std::shared_ptr<runtime::RocksDBStorage> storage);
+
+   static constexpr std::array<CatalogEntryType, 1> entryTypes = {CatalogEntryType::LINGODB_TABLE_ENTRY};
+   void serializeEntry(lingodb::utility::Serializer& serializer) const override;
+   static std::shared_ptr<RocksDBTableCatalogEntry> deserialize(lingodb::utility::Deserializer& deserializer);
+   const Sample& getSample() const override;
+   const ColumnStatistics& getColumnStatistics(std::string_view column) const override;
+   size_t getNumRows() const override;
+   ~RocksDBTableCatalogEntry() override = default;
+   runtime::TableStorage& getTableStorage() override;
+   virtual void flush() override;
+   virtual void ensureFullyLoaded() override;
+   virtual void setShouldPersist(bool shouldPersist) override;
+   virtual void setDBDir(std::string dbDir) override;
+   static std::shared_ptr<RocksDBTableCatalogEntry> createFromCreateTable(const CreateTableDef& def, 
+                                                                          std::shared_ptr<runtime::RocksDBStorage> storage);
+};
+#endif // WITH_ROCKSDB
+
 } //namespace lingodb::catalog
 
 #endif //LINGODB_CATALOG_TABLECATALOGENTRY_H

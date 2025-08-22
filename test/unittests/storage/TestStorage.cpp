@@ -18,6 +18,7 @@
 #include <arrow/ipc/json_simple.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/table.h>
+#include <iostream>
 
 using namespace lingodb::utility;
 using namespace lingodb::catalog;
@@ -149,14 +150,17 @@ TEST_CASE("Storage") {
 TEST_CASE("Storage:RelationHelper") {
    auto scheduler = lingodb::scheduler::startScheduler();
 
-   fs::path tempDir = fs::temp_directory_path() / "lingodb-test-dir";
+   fs::path tempDir = fs::temp_directory_path() / "lingodb-test-dir-relationhelper";
    //if exists: delete
    if (fs::exists(tempDir)) {
       fs::remove_all(tempDir);
    }
    fs::create_directories(tempDir);
    {
-      auto session = lingodb::runtime::Session::createSession(tempDir, true);
+      // Explicitly use standard catalog to avoid database format detection issues
+      auto catalog = Catalog::create(tempDir.string(), true);
+      catalog->setShouldPersist(true);
+      auto session = std::make_shared<lingodb::runtime::Session>(catalog);
       auto context = session->createExecutionContext();
       CreateTableDef createTableDef;
       createTableDef.name = "test_table";
@@ -170,10 +174,11 @@ TEST_CASE("Storage:RelationHelper") {
    }
 
    lingodb::scheduler::awaitEntryTask(std::make_unique<MockTask>([&]() {
-      auto session = lingodb::runtime::Session::createSession(tempDir, true);
+      // Explicitly use standard catalog to maintain consistency
+      auto catalog = Catalog::create(tempDir.string(), true);
+      auto session = std::make_shared<lingodb::runtime::Session>(catalog);
       auto context = session->createExecutionContext();
 
-      auto catalog = session->getCatalog();
       auto tableEntry = catalog->getTypedEntry<TableCatalogEntry>("test_table");
       REQUIRE(tableEntry != std::nullopt);
       auto indexEntry = catalog->getTypedEntry<IndexCatalogEntry>("test_table.pk");

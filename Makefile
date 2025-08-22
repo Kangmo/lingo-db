@@ -1,4 +1,5 @@
-ROOT_DIR := $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
+SHELL := /bin/bash
+ROOT_DIR := $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
 NPROCS := $(shell if [ "$(shell uname)" = "Darwin" ]; then sysctl -n hw.logicalcpu; else nproc; fi)
 LLVM_LIT_BINARY := lit
 CMAKE_PREFIX_PATH ?= ""
@@ -13,7 +14,8 @@ build:
 	mkdir -p $@
 
 
-resources/data/%/.rawdata:
+# Legacy rawdata target for benchmark datasets (tpch, tpcds, etc.)
+build/lingodb-$(DATA_BUILD_TYPE)/benchdata/%/.rawdata:
 	@mkdir -p $@
 	@dir_name=$(shell dirname $@) && \
 	base_name=$$(basename $$dir_name) && \
@@ -28,18 +30,42 @@ resources/data/%/.rawdata:
 		exit 1; \
 	fi
 
-
-
-resources/data/%/.stamp: resources/data/%/.rawdata build/lingodb-$(DATA_BUILD_TYPE)/.buildstamp
-	rm -f resources/data/$*/*.arrow
-	rm -f resources/data/$*/*.hashidx
-	rm -f resources/data/$*/*.lingodb
+# Legacy benchmark data target (for tpch, tpcds, etc.)
+build/lingodb-$(DATA_BUILD_TYPE)/benchdata/%/.stamp: build/lingodb-$(DATA_BUILD_TYPE)/benchdata/%/.rawdata build/lingodb-$(DATA_BUILD_TYPE)/.buildstamp
+	@mkdir -p build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/*.arrow
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/*.hashidx
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/*.lingodb
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/*.sst
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/*.log
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/CURRENT
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/IDENTITY
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/LOCK
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/LOG*
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/MANIFEST-*
+	rm -f build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/OPTIONS-*
 	@dir_name=$(shell dirname $@) && \
 	base_name=$$(basename $$dir_name) && \
 	dataset_name=$$(echo $$base_name | sed -E 's/-[0-9]+$$//') && \
 	cd $(dir $@)/.rawdata && $(ROOT_DIR)/build/lingodb-$(DATA_BUILD_TYPE)/sql ../ < $(ROOT_DIR)/resources/sql/$$dataset_name/initialize.sql
 	touch $@
-	rm -rf resources/data/$*/.rawdata
+	rm -rf build/lingodb-$(DATA_BUILD_TYPE)/benchdata/$*/.rawdata
+
+# Create test data in build directory  
+build/lingodb-$(TEST_BUILD_TYPE)/testdata/%/.stamp: build/lingodb-$(TEST_BUILD_TYPE)/.buildstamp
+	@echo "Creating test database '$*' in build directory..."
+	@rm -rf build/lingodb-$(TEST_BUILD_TYPE)/testdata/$*
+	@mkdir -p build/lingodb-$(TEST_BUILD_TYPE)/testdata/$*
+	@$(ROOT_DIR)/build/lingodb-$(TEST_BUILD_TYPE)/sql build/lingodb-$(TEST_BUILD_TYPE)/testdata/$* < $(ROOT_DIR)/resources/sql/$*/initialize.sql || true
+	@touch $@
+
+# Create test data in build directory for coverage builds
+build/lingodb-debug-coverage/testdata/%/.stamp: build/lingodb-debug-coverage/.buildstamp
+	@echo "Creating test database '$*' in coverage build directory..."
+	@rm -rf build/lingodb-debug-coverage/testdata/$*
+	@mkdir -p build/lingodb-debug-coverage/testdata/$*
+	@$(ROOT_DIR)/build/lingodb-debug-coverage/sql build/lingodb-debug-coverage/testdata/$* < $(ROOT_DIR)/resources/sql/$*/initialize.sql || true
+	@touch $@
 
 
 
@@ -87,7 +113,7 @@ run-test: build/lingodb-$(TEST_BUILD_TYPE)/.stamp
 	cmake --build $(dir $<) --target mlir-db-opt run-mlir run-sql sql-to-mlir sqlite-tester tester -- -j${NPROCS}
 	$(MAKE) test-no-rebuild
 
-test-no-rebuild: build/lingodb-$(TEST_BUILD_TYPE)/.buildstamp resources/data/test/.stamp resources/data/uni/.stamp
+test-no-rebuild: build/lingodb-$(TEST_BUILD_TYPE)/.buildstamp build/lingodb-$(TEST_BUILD_TYPE)/testdata/test/.stamp build/lingodb-$(TEST_BUILD_TYPE)/testdata/uni/.stamp
 	${LLVM_LIT_BINARY} -v build/lingodb-$(TEST_BUILD_TYPE)/test/lit -j 1
 	./build/lingodb-$(TEST_BUILD_TYPE)/tester
 	find ./test/sqlite-small/ -maxdepth 1 -type f -name '*.test' | xargs -L 1 -P ${NPROCS} ./build/lingodb-$(TEST_BUILD_TYPE)/sqlite-tester
@@ -96,7 +122,7 @@ sqlite-test-no-rebuild: build/lingodb-$(SQLITE_TEST_BUILD_TYPE)/.buildstamp
 	find ./test/sqlite/ -maxdepth 1 -type f -name '*.test' | xargs -L 1 -P ${NPROCS} ./build/lingodb-$(SQLITE_TEST_BUILD_TYPE)/sqlite-tester
 
 .PHONY: test-coverage
-test-coverage: build/lingodb-debug-coverage/.stamp resources/data/test/.stamp resources/data/uni/.stamp
+test-coverage: build/lingodb-debug-coverage/.stamp build/lingodb-debug-coverage/testdata/test/.stamp build/lingodb-debug-coverage/testdata/uni/.stamp
 	cmake --build $(dir $<) --target mlir-db-opt run-mlir run-sql sql-to-mlir tester -- -j${NPROCS}
 	${LLVM_LIT_BINARY} -v --per-test-coverage  $(dir $<)/test/lit
 	LLVM_PROFILE_FILE=$(dir $<)/tester.profraw ./build/lingodb-debug-coverage/tester
@@ -111,14 +137,14 @@ coverage: build/lingodb-debug-coverage/.stamp
 
 
 .PHONY: run-benchmark
-run-benchmark: build/lingodb-release/.stamp resources/data/tpch-1/.stamp
+run-benchmark: build/lingodb-release/.stamp build/lingodb-release/benchdata/tpch-1/.stamp
 	cmake --build $(dir $<) --target run-sql -- -j${NPROCS}
-	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpch.py $(dir $<) tpch-1
+	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpch.py $(dir $<) benchdata/tpch-1
 
-run-benchmarks: build/lingodb-release/.stamp resources/data/tpch-1/.stamp resources/data/tpcds-1/.stamp
+run-benchmarks: build/lingodb-release/.stamp build/lingodb-release/benchdata/tpch-1/.stamp build/lingodb-release/benchdata/tpcds-1/.stamp
 	cmake --build $(dir $<) --target run-sql -- -j${NPROCS}
-	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpch.py $(dir $<) tpch-1
-	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpcds.py $(dir $<) tpcds-1
+	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpch.py $(dir $<) benchdata/tpch-1
+	env QUERY_RUNS=5 env LINGODB_EXECUTION_MODE=SPEED python3 tools/scripts/benchmark-tpcds.py $(dir $<) benchdata/tpcds-1
 
 build-docker-dev:
 	DOCKER_BUILDKIT=1 docker build -f "tools/docker/Dockerfile" -t lingodb-dev --target baseimg "."
