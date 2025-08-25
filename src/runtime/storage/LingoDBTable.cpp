@@ -276,7 +276,41 @@ void LingoDBTable::append(const std::shared_ptr<arrow::Table>& table) {
 void LingoDBTable::append(const std::vector<std::shared_ptr<arrow::RecordBatch>>& toAppend) {
    ensureLoaded();
    for (auto& batch : toAppend) {
-      if (batch->schema()->Equals(*schema)) {
+      // Check schema compatibility (ignoring nullability differences)
+      bool schemaCompatible = true;
+      if (batch->schema()->num_fields() != schema->num_fields()) {
+         schemaCompatible = false;
+      } else {
+         for (int i = 0; i < schema->num_fields(); i++) {
+            auto batchField = batch->schema()->field(i);
+            auto schemaField = schema->field(i);
+            
+            // Check field name
+            if (batchField->name() != schemaField->name()) {
+               schemaCompatible = false;
+               break;
+            }
+            
+            // Check field type compatibility
+            bool typeCompatible = false;
+            if (batchField->type()->Equals(schemaField->type())) {
+               typeCompatible = true;
+            } else if ((batchField->type()->id() == arrow::Type::FIXED_SIZE_BINARY && 
+                        schemaField->type()->id() == arrow::Type::STRING) ||
+                       (batchField->type()->id() == arrow::Type::STRING && 
+                        schemaField->type()->id() == arrow::Type::FIXED_SIZE_BINARY)) {
+               // Allow conversion between fixed_size_binary and string
+               typeCompatible = true;
+            }
+            
+            if (!typeCompatible) {
+               schemaCompatible = false;
+               break;
+            }
+         }
+      }
+      
+      if (schemaCompatible) {
          tableData.push_back(TableChunk{batch, numRows});
          numRows += batch->num_rows();
       } else {

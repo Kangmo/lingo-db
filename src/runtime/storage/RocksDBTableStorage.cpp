@@ -122,31 +122,19 @@ namespace utility = lingodb::utility;
 // static utility::Tracer::Event processMorsel("DataSourceIteration", "processMorsel");
 static utility::Tracer::Event processMorselSingle("DataSourceIteration", "processMorselSingle");
 
-std::shared_ptr<arrow::RecordBatch> createSample(const std::vector<lingodb::runtime::RocksDBTableStorage::TableChunk>& data) {
-    size_t numRows = 0;
-    for (auto& batch : data) {
-        numRows += batch.data()->num_rows();
-    }
-    if (numRows == 0) {
-        return std::shared_ptr<arrow::RecordBatch>();
+// Helper function to create sample data from a record batch
+std::shared_ptr<arrow::RecordBatch> createSample(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    if (!batch || batch->num_rows() == 0) {
+        return nullptr;
     }
     
-    std::vector<size_t> result;
-    auto rng = std::mt19937{std::random_device{}()};
-    
-    // Simple random sampling implementation
-    size_t sampleSize = std::min<size_t>(numRows, 1024ull);
-    for (size_t i = 0; i < sampleSize; ++i) {
-        result.push_back(rng() % numRows);
+    // For simplicity, if the batch is small enough, use it as-is
+    if (batch->num_rows() <= 1024) {
+        return batch;
     }
-    std::sort(result.begin(), result.end());
     
-    // For simplicity, just return the first batch as sample
-    // In a full implementation, we'd sample across all batches
-    if (!data.empty()) {
-        return data[0].data();
-    }
-    return nullptr;
+    // Otherwise, take the first 1024 rows as sample
+    return batch->Slice(0, 1024);
 }
 
 size_t countDistinctValues(std::shared_ptr<arrow::ChunkedArray> column) {
@@ -166,17 +154,19 @@ size_t countDistinctValues(std::shared_ptr<arrow::ChunkedArray> column) {
 
 namespace lingodb::runtime {
 
-// RocksDB-specific scan task implementation
-class RocksDBScanTask : public scheduler::TaskWithImplicitContext {
-    std::vector<RocksDBTableStorage::TableChunk>& batches;
+// RocksDB-specific direct scan task implementation
+class RocksDBDirectScanTask : public scheduler::TaskWithImplicitContext {
+    RocksDBTableStorage* storage;
     std::vector<size_t> colIds;
     std::function<void(lingodb::runtime::BatchView*)> cb;
+    size_t totalChunks;
 
 public:
-    RocksDBScanTask(std::vector<RocksDBTableStorage::TableChunk>& batches, 
-                   std::vector<size_t> colIds, 
-                   const std::function<void(lingodb::runtime::BatchView*)>& cb) 
-        : batches(batches), colIds(colIds), cb(cb) {}
+    RocksDBDirectScanTask(RocksDBTableStorage* storage,
+                         const std::vector<size_t>& colIds,
+                         const std::function<void(lingodb::runtime::BatchView*)>& cb,
+                         size_t totalChunks)
+        : storage(storage), colIds(colIds), cb(cb), totalChunks(totalChunks) {}
 
     bool allocateWork() override {
         if (!workExhausted.exchange(true)) {
@@ -191,63 +181,186 @@ public:
         batchView.arrays = arrayViewPtrs.data();
         batchView.offset = 0;
         batchView.length = 0;
-
-        for (auto& batch : batches) {
-            utility::Tracer::Trace trace(processMorselSingle);
-            batchView.length = batch.getNumRows();
+        batchView.selectionVector = nullptr;
+        
+        // Process all chunks in one go, similar to original implementation
+        for (size_t chunkId = 0; chunkId < totalChunks; chunkId++) {
+            auto batch = storage->loadRecordBatch(chunkId);
+            if (!batch || batch->num_rows() == 0) continue;
+            
+            // Convert to ArrayView format for processing
+            std::vector<ArrayView> columnViews;
+            std::vector<std::vector<const void*>> bufferStorage;
+            columnViews.reserve(colIds.size());
+            bufferStorage.reserve(colIds.size());
+            
             for (size_t i = 0; i < colIds.size(); i++) {
-                batchView.arrays[i] = batch.getArrayView(colIds[i]);
+                auto array = batch->column(colIds[i]);
+                ArrayView view;
+                view.length = array->length();
+                view.nullCount = array->null_count();
+                view.offset = array->offset();
+                
+                // Get buffers from Arrow array
+                std::vector<const void*> buffers;
+                auto arrayData = array->data();
+                for (const auto& buffer : arrayData->buffers) {
+                    if (buffer) {
+                        buffers.push_back(buffer->data());
+                    } else {
+                        buffers.push_back(nullptr);
+                    }
+                }
+                if (!buffers.empty() && !buffers[0]) {
+                    buffers[0] = ArrayView::validData.data();
+                }
+                bufferStorage.push_back(buffers);
+                
+                view.nBuffers = buffers.size();
+                view.buffers = bufferStorage.back().data();
+                view.nChildren = 0;
+                view.children = nullptr;
+                
+                columnViews.push_back(view);
             }
+            
+            // Update BatchView with this chunk's data
+            std::vector<const ArrayView*> chunkArrayViewPtrs;
+            for (auto& view : columnViews) {
+                chunkArrayViewPtrs.push_back(&view);
+            }
+            
+            batchView.arrays = chunkArrayViewPtrs.data();
+            batchView.length = batch->num_rows();
+            
+            utility::Tracer::Trace trace(processMorselSingle);
             cb(&batchView);
             trace.stop();
         }
     }
     
-    ~RocksDBScanTask() = default;
+    ~RocksDBDirectScanTask() = default;
 };
 
-// TableChunk implementation
-RocksDBTableStorage::TableChunk::TableChunk(std::shared_ptr<arrow::RecordBatch> data, size_t startRowId) 
-    : internalData(data), startRowId(startRowId), numRows(data->num_rows()) {
-    std::vector<size_t> bufferStart;
-    for (auto colId = 0; colId < data->num_columns(); colId++) {
-        auto arrayData = data->column(colId)->data();
-        size_t currBufId = buffers.size();
-        for (size_t i = 0; i < arrayData->buffers.size(); i++) {
-            auto buffer = arrayData->buffers[i];
-            if (buffer) {
-                buffers.push_back(buffer->data());
-            } else {
-                buffers.push_back(nullptr);
-            }
-        }
-        if (!buffers[currBufId]) {
-            buffers[currBufId] = ArrayView::validData.data();
-        }
-        bufferStart.push_back(currBufId);
+// Column-oriented storage implementation
+void RocksDBTableStorage::storeColumn(const std::string& columnName, size_t chunkId, 
+                                      const std::shared_ptr<arrow::Array>& array) {
+    std::string key = getColumnKey(columnName, chunkId);
+    
+    // Get the field from schema to ensure consistent type storage
+    auto field = schema->GetFieldByName(columnName);
+    if (!field) {
+        throw std::runtime_error("Column not found in schema: " + columnName);
     }
-    for (auto colId = 0; colId < data->num_columns(); colId++) {
-        auto arrayData = data->column(colId)->data();
-        columnInfo.push_back(ArrayView{
-            .length = arrayData->length,
-            .nullCount = arrayData->null_count,
-            .offset = arrayData->offset,
-            .nBuffers = static_cast<int64_t>(arrayData->buffers.size()),
-            .nChildren = static_cast<int64_t>(arrayData->child_data.size()),
-            .buffers = &buffers[bufferStart.at(colId)],
-            .children = nullptr
-        });
+    
+    // If types don't match exactly, cast the array to the schema's type
+    std::shared_ptr<arrow::Array> arrayToStore = array;
+    if (!array->type()->Equals(field->type())) {
+        // Cast to the expected type
+        arrow::compute::CastOptions cast_options;
+        cast_options.allow_invalid_utf8 = true;
+        auto result = arrow::compute::Cast(*array, field->type(), cast_options);
+        if (!result.ok()) {
+            throw std::runtime_error("Failed to cast array to schema type: " + result.status().ToString());
+        }
+        // Cast returns a Result<Datum> which contains the array
+        arrow::Datum datum = result.ValueOrDie();
+        arrayToStore = datum.make_array();
     }
+    
+    auto tempSchema = arrow::schema({field});
+    auto batch = arrow::RecordBatch::Make(tempSchema, arrayToStore->length(), {arrayToStore});
+    
+    // Serialize the batch
+    arrow::ipc::IpcWriteOptions options;
+    auto result = arrow::ipc::SerializeRecordBatch(*batch, options);
+    if (!result.ok()) {
+        throw std::runtime_error("Failed to serialize column: " + result.status().ToString());
+    }
+    
+    auto buffer = result.ValueOrDie();
+    std::string value(reinterpret_cast<const char*>(buffer->data()), buffer->size());
+    
+    auto status = storage->put(RocksDBStorage::ColumnFamily::TABLES, key, value);
+    if (!status.ok()) {
+        throw std::runtime_error("Failed to store column: " + status.ToString());
+    }
+}
+
+std::shared_ptr<arrow::Array> RocksDBTableStorage::loadColumn(const std::string& columnName, 
+                                                              size_t chunkId) const {
+    std::string key = getColumnKey(columnName, chunkId);
+    std::string value;
+    
+    auto status = storage->get(RocksDBStorage::ColumnFamily::TABLES, key, &value);
+    if (!status.ok()) {
+        if (status.IsNotFound()) {
+            return nullptr;
+        }
+        throw std::runtime_error("Failed to load column: " + status.ToString());
+    }
+    
+    // Get the field for this column
+    auto field = schema->GetFieldByName(columnName);
+    if (!field) {
+        throw std::runtime_error("Column not found in schema: " + columnName);
+    }
+    
+    // Create a temporary schema for deserialization
+    auto tempSchema = arrow::schema({field});
+    
+    // Deserialize the record batch
+    arrow::ipc::DictionaryMemo dict_memo;
+    arrow::ipc::IpcReadOptions read_options;
+    auto bufferReader = arrow::io::BufferReader::FromString(value);
+    
+    auto result = arrow::ipc::ReadRecordBatch(tempSchema, &dict_memo, read_options, bufferReader.get());
+    if (!result.ok()) {
+        std::cerr << "Failed to deserialize column " << columnName << " for chunk " << chunkId << std::endl;
+        std::cerr << "Data size: " << value.size() << " bytes" << std::endl;
+        throw std::runtime_error("Failed to deserialize column: " + result.status().ToString());
+    }
+    
+    // Extract the array from the batch
+    auto batch = result.ValueOrDie();
+    if (batch && batch->num_columns() > 0) {
+        return batch->column(0);
+    }
+    
+    return nullptr;
+}
+
+RocksDBTableStorage::ColumnBuffer RocksDBTableStorage::loadColumnBuffer(const std::string& columnName, 
+                                                                        size_t chunkId) const {
+    ColumnBuffer buffer;
+    buffer.chunkId = chunkId;
+    
+    std::string key = getColumnKey(columnName, chunkId);
+    auto status = storage->get(RocksDBStorage::ColumnFamily::TABLES, key, &buffer.data);
+    
+    if (!status.ok()) {
+        throw std::runtime_error("Failed to load column buffer: " + status.ToString());
+    }
+    
+    // For now, we'll deserialize to get the row count
+    // In a production system, this would be stored separately
+    auto array = loadColumn(columnName, chunkId);
+    if (array) {
+        buffer.numRows = array->length();
+    }
+    
+    return buffer;
 }
 
 // RocksDBTableStorage implementation
 RocksDBTableStorage::RocksDBTableStorage(std::shared_ptr<RocksDBStorage> storage,
                                        const std::string& tableName,
                                        std::shared_ptr<arrow::Schema> schema)
-    : storage(storage), tableName(tableName), schema(schema), sample(schema), numRows(0) {
+    : storage(storage), tableName(tableName), schema(schema), sample(schema), numRows(0), numChunks(0) {
     for (auto c : schema->fields()) {
         columnStatistics[c->name()] = catalog::ColumnStatistics(std::nullopt);
     }
+    deserializeMetadata();
 }
 
 RocksDBTableStorage::RocksDBTableStorage(std::shared_ptr<RocksDBStorage> storage,
@@ -257,7 +370,8 @@ RocksDBTableStorage::RocksDBTableStorage(std::shared_ptr<RocksDBStorage> storage
                                        catalog::Sample sample,
                                        ColumnStatisticsMap columnStatistics)
     : storage(storage), tableName(tableName), schema(schema), sample(std::move(sample)),
-      numRows(numRows), columnStatistics(std::move(columnStatistics)) {}
+      numRows(numRows), numChunks((numRows + CHUNK_SIZE - 1) / CHUNK_SIZE),
+      columnStatistics(std::move(columnStatistics)) {}
 
 std::unique_ptr<RocksDBTableStorage> RocksDBTableStorage::create(std::shared_ptr<RocksDBStorage> storage,
                                                                const catalog::CreateTableDef& def) {
@@ -285,39 +399,74 @@ void RocksDBTableStorage::append(const std::shared_ptr<arrow::Table>& table) {
 }
 
 void RocksDBTableStorage::append(const std::vector<std::shared_ptr<arrow::RecordBatch>>& toAppend) {
-    ensureLoaded();
-    
-    size_t currentChunkId = getChunkCount();
+    size_t currentChunkId = numChunks;
     
     for (auto& batch : toAppend) {
-        if (batch->schema()->Equals(*schema)) {
-            // Store the chunk in RocksDB
-            storeChunk(currentChunkId, batch);
-            
-            // Update in-memory cache
-            chunkCache.push_back(TableChunk{batch, numRows});
-            numRows += batch->num_rows();
-            currentChunkId++;
-        } else {
+        // Check schema compatibility (ignoring nullability differences)
+        if (batch->schema()->num_fields() != schema->num_fields()) {
             std::cout << "schema to add: " << batch->schema()->ToString() << std::endl;
             std::cout << "schema of table: " << schema->ToString() << std::endl;
-            throw std::runtime_error("schema mismatch");
+            throw std::runtime_error("schema mismatch: different number of fields");
         }
+        
+        for (int i = 0; i < schema->num_fields(); i++) {
+            auto batchField = batch->schema()->field(i);
+            auto schemaField = schema->field(i);
+            
+            // Check field name
+            if (batchField->name() != schemaField->name()) {
+                std::cout << "schema to add: " << batch->schema()->ToString() << std::endl;
+                std::cout << "schema of table: " << schema->ToString() << std::endl;
+                throw std::runtime_error("schema mismatch: field name mismatch");
+            }
+            
+            // Check field type compatibility
+            // Allow some compatible type conversions:
+            // - fixed_size_binary to string
+            // - string to fixed_size_binary  
+            bool typeCompatible = false;
+            
+            if (batchField->type()->Equals(schemaField->type())) {
+                typeCompatible = true;
+            } else if ((batchField->type()->id() == arrow::Type::FIXED_SIZE_BINARY && 
+                        schemaField->type()->id() == arrow::Type::STRING) ||
+                       (batchField->type()->id() == arrow::Type::STRING && 
+                        schemaField->type()->id() == arrow::Type::FIXED_SIZE_BINARY)) {
+                // Allow conversion between fixed_size_binary and string
+                typeCompatible = true;
+            }
+            
+            if (!typeCompatible) {
+                std::cout << "Field " << i << " (" << batchField->name() << "):" << std::endl;
+                std::cout << "  Batch type: " << batchField->type()->ToString() << " (id=" << batchField->type()->id() << ")" << std::endl;
+                std::cout << "  Table type: " << schemaField->type()->ToString() << " (id=" << schemaField->type()->id() << ")" << std::endl;
+                std::cout << "schema to add: " << batch->schema()->ToString() << std::endl;
+                std::cout << "schema of table: " << schema->ToString() << std::endl;
+                throw std::runtime_error("schema mismatch: field type mismatch");
+            }
+        }
+        
+        // Store the batch using column-oriented storage
+        storeRecordBatch(currentChunkId, batch);
+        
+        numRows += batch->num_rows();
+        currentChunkId++;
     }
+    
+    numChunks = currentChunkId;
     
     // Update statistics (only if we have data)
     if (!toAppend.empty()) {
         auto tableView = arrow::Table::FromRecordBatches(toAppend).ValueOrDie();
         updateStatistics(tableView);
+        
+        // Update sample - use first batch for sampling
+        if (!toAppend.empty()) {
+            sample = catalog::Sample(toAppend[0]);
+        }
     }
     
-    // Update sample
-    auto sampleBatch = createSample(chunkCache);
-    if (sampleBatch) {
-        sample = catalog::Sample(sampleBatch);
-    }
-    
-    // Flush metadata
+    // Persist metadata
     serializeMetadata();
     flush();
 }
@@ -353,34 +502,11 @@ std::shared_ptr<arrow::DataType> RocksDBTableStorage::getColumnStorageType(std::
     return field->type();
 }
 
-void RocksDBTableStorage::ensureLoaded() const {
-    if (!loaded) {
-        const_cast<RocksDBTableStorage*>(this)->loaded = true;
-        const_cast<RocksDBTableStorage*>(this)->deserializeMetadata();
-        if (numRows > 0) {
-            const_cast<RocksDBTableStorage*>(this)->loadAllChunks();
-        }
-    }
-}
-
-std::pair<const RocksDBTableStorage::TableChunk*, size_t> RocksDBTableStorage::getByRowId(size_t rowId) const {
-    ensureLoaded();
-    
-    size_t currentRow = 0;
-    for (const auto& chunk : chunkCache) {
-        if (rowId >= currentRow && rowId < currentRow + chunk.getNumRows()) {
-            return {&chunk, rowId - currentRow};
-        }
-        currentRow += chunk.getNumRows();
-    }
-    
-    // Return nullptr for invalid row IDs instead of throwing an exception
-    return {nullptr, 0};
-}
+// Methods removed - no longer using in-memory cache
 
 // Key generation methods
-std::string RocksDBTableStorage::getChunkKey(size_t chunkId) const {
-    return "chunk:" + tableName + ":" + std::to_string(chunkId);
+std::string RocksDBTableStorage::getColumnKey(const std::string& columnName, size_t chunkId) const {
+    return "column:" + tableName + ":" + columnName + ":" + std::to_string(chunkId);
 }
 
 std::string RocksDBTableStorage::getMetadataKey() const {
@@ -395,46 +521,34 @@ std::string RocksDBTableStorage::getSampleKey() const {
     return "sample:" + tableName;
 }
 
-// Arrow serialization helpers
-std::string RocksDBTableStorage::serializeRecordBatch(const std::shared_ptr<arrow::RecordBatch>& batch) const {
-    arrow::ipc::IpcWriteOptions options;
-    auto buffer = arrow::ipc::SerializeRecordBatch(*batch, options).ValueOrDie();
-    return std::string(reinterpret_cast<const char*>(buffer->data()), buffer->size());
-}
-
-std::shared_ptr<arrow::RecordBatch> RocksDBTableStorage::deserializeRecordBatch(const std::string& data) const {
-    auto buffer = std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(data.data()), data.size());
-    arrow::ipc::DictionaryMemo dict_memo;
-    arrow::ipc::IpcReadOptions options;
-    auto bufferReader = arrow::io::BufferReader::FromString(data);
-    auto result = arrow::ipc::ReadRecordBatch(schema, &dict_memo, options, bufferReader.get());
-    if (!result.ok()) {
-        throw std::runtime_error("Failed to deserialize record batch: " + result.status().ToString());
-    }
-    return result.ValueOrDie();
-}
-
-// Chunk management
-void RocksDBTableStorage::storeChunk(size_t chunkId, const std::shared_ptr<arrow::RecordBatch>& batch) {
-    std::string key = getChunkKey(chunkId);
-    std::string value = serializeRecordBatch(batch);
-    
-    auto status = storage->put(RocksDBStorage::ColumnFamily::TABLES, key, value);
-    if (!status.ok()) {
-        throw std::runtime_error("Failed to store chunk: " + status.ToString());
+// Batch operations  
+void RocksDBTableStorage::storeRecordBatch(size_t chunkId, const std::shared_ptr<arrow::RecordBatch>& batch) {
+    // Store each column separately
+    for (int i = 0; i < batch->num_columns(); i++) {
+        auto column = batch->column(i);
+        auto columnName = batch->column_name(i);
+        storeColumn(columnName, chunkId, column);
     }
 }
 
-std::shared_ptr<arrow::RecordBatch> RocksDBTableStorage::loadChunk(size_t chunkId) const {
-    std::string key = getChunkKey(chunkId);
-    std::string value;
+std::shared_ptr<arrow::RecordBatch> RocksDBTableStorage::loadRecordBatch(size_t chunkId) const {
+    std::vector<std::shared_ptr<arrow::Array>> arrays;
+    std::vector<std::shared_ptr<arrow::Field>> fields;
     
-    auto status = storage->get(RocksDBStorage::ColumnFamily::TABLES, key, &value);
-    if (!status.ok()) {
-        throw std::runtime_error("Failed to load chunk: " + status.ToString());
+    // Load each column
+    for (const auto& field : schema->fields()) {
+        auto array = loadColumn(field->name(), chunkId);
+        if (!array) {
+            // If any column is missing, return nullptr
+            return nullptr;
+        }
+        arrays.push_back(array);
+        fields.push_back(field);
     }
     
-    return deserializeRecordBatch(value);
+    // Create the record batch
+    auto result = arrow::RecordBatch::Make(schema, arrays[0]->length(), arrays);
+    return result;
 }
 
 void RocksDBTableStorage::updateStatistics(const std::shared_ptr<arrow::Table>& table) {
@@ -446,74 +560,19 @@ void RocksDBTableStorage::updateStatistics(const std::shared_ptr<arrow::Table>& 
     }
 }
 
-void RocksDBTableStorage::invalidateCache() const {
-    cacheValid = false;
-    chunkCache.clear();
+// Utility methods
+size_t RocksDBTableStorage::getChunkForRow(size_t rowId) const {
+    return rowId / CHUNK_SIZE;
 }
 
-void RocksDBTableStorage::loadAllChunks() {
-    if (cacheValid) return;
-    
-    chunkCache.clear();
-    auto chunkIds = getChunkIds();
-    
-    size_t currentRowId = 0;
-    for (size_t chunkId : chunkIds) {
-        auto batch = loadChunk(chunkId);
-        chunkCache.push_back(TableChunk{batch, currentRowId});
-        currentRowId += batch->num_rows();
-    }
-    
-    cacheValid = true;
-}
-
-size_t RocksDBTableStorage::getChunkCount() const {
-    // Count chunks by iterating through keys with chunk prefix
-    auto iterator = storage->newIterator(RocksDBStorage::ColumnFamily::TABLES);
-    std::string prefix = "chunk:" + tableName + ":";
-    
-    size_t count = 0;
-    iterator->Seek(prefix);
-    while (iterator->Valid()) {
-        std::string key = iterator->key().ToString();
-        if (key.substr(0, prefix.length()) != prefix) {
-            break;
-        }
-        count++;
-        iterator->Next();
-    }
-    
-    return count;
-}
-
-std::vector<size_t> RocksDBTableStorage::getChunkIds() const {
-    auto iterator = storage->newIterator(RocksDBStorage::ColumnFamily::TABLES);
-    std::string prefix = "chunk:" + tableName + ":";
-    
-    std::vector<size_t> chunkIds;
-    iterator->Seek(prefix);
-    while (iterator->Valid()) {
-        std::string key = iterator->key().ToString();
-        if (key.substr(0, prefix.length()) != prefix) {
-            break;
-        }
-        
-        // Extract chunk ID from key
-        std::string chunkIdStr = key.substr(prefix.length());
-        size_t chunkId = std::stoull(chunkIdStr);
-        chunkIds.push_back(chunkId);
-        
-        iterator->Next();
-    }
-    
-    std::sort(chunkIds.begin(), chunkIds.end());
-    return chunkIds;
+size_t RocksDBTableStorage::getRowOffsetInChunk(size_t rowId) const {
+    return rowId % CHUNK_SIZE;
 }
 
 void RocksDBTableStorage::serializeMetadata() const {
     // Serialize basic metadata
     std::ostringstream metadataStream;
-    metadataStream << numRows << "|" << schema->num_fields();
+    metadataStream << numRows << "|" << numChunks << "|" << schema->num_fields();
     for (const auto& field : schema->fields()) {
         metadataStream << "|" << field->name();
     }
@@ -534,7 +593,11 @@ void RocksDBTableStorage::serializeMetadata() const {
     
     // Store sample if available
     if (sample) {
-        std::string sampleValue = serializeRecordBatch(sample.getSampleData());
+        // Serialize sample using Arrow IPC
+        auto sampleBatch = sample.getSampleData();
+        arrow::ipc::IpcWriteOptions options;
+        auto buffer = arrow::ipc::SerializeRecordBatch(*sampleBatch, options).ValueOrDie();
+        std::string sampleValue(reinterpret_cast<const char*>(buffer->data()), buffer->size());
         status = storage->put(RocksDBStorage::ColumnFamily::METADATA, getSampleKey(), sampleValue);
         if (!status.ok()) {
             throw std::runtime_error("Failed to store sample: " + status.ToString());
@@ -552,6 +615,9 @@ void RocksDBTableStorage::deserializeMetadata() const {
         std::string token;
         std::getline(metadataStream, token, '|');
         const_cast<RocksDBTableStorage*>(this)->numRows = std::stoull(token);
+        if (std::getline(metadataStream, token, '|')) {
+            const_cast<RocksDBTableStorage*>(this)->numChunks = std::stoull(token);
+        }
     }
     
     // Load schema 
@@ -571,25 +637,31 @@ void RocksDBTableStorage::deserializeMetadata() const {
     std::string sampleValue;
     status = storage->get(RocksDBStorage::ColumnFamily::METADATA, getSampleKey(), &sampleValue);
     if (status.ok()) {
-        auto sampleBatch = deserializeRecordBatch(sampleValue);
-        if (sampleBatch) {
-            const_cast<RocksDBTableStorage*>(this)->sample = catalog::Sample(sampleBatch);
+        // Deserialize sample using Arrow IPC
+        arrow::ipc::DictionaryMemo dict_memo;
+        arrow::ipc::IpcReadOptions options;
+        auto bufferReader = arrow::io::BufferReader::FromString(sampleValue);
+        auto result = arrow::ipc::ReadRecordBatch(schema, &dict_memo, options, bufferReader.get());
+        if (result.ok()) {
+            auto sampleBatch = result.ValueOrDie();
+            if (sampleBatch) {
+                const_cast<RocksDBTableStorage*>(this)->sample = catalog::Sample(sampleBatch);
+            }
         }
     }
 }
 
 std::unique_ptr<scheduler::Task> RocksDBTableStorage::createScanTask(const ScanConfig& scanConfig) {
-    ensureLoaded();
     std::vector<size_t> colIds;
+    
     for (const auto& c : scanConfig.columns) {
         auto colId = schema->GetFieldIndex(c);
         assert(colId >= 0);
         colIds.push_back(colId);
     }
     
-    // For simplicity, always use single-threaded for now
-    // Could implement parallel scanning similar to LingoDBTable
-    return std::make_unique<RocksDBScanTask>(chunkCache, colIds, scanConfig.cb);
+    // Use direct scanning from RocksDB
+    return std::make_unique<RocksDBDirectScanTask>(this, colIds, scanConfig.cb, numChunks);
 }
 
 } // namespace lingodb::runtime

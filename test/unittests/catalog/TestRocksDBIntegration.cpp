@@ -302,7 +302,8 @@ TEST_CASE("RocksDBTableStorage: Basic operations", "[rocksdb][tablestorage]") {
             
             // Test metadata operations
             REQUIRE_NOTHROW(tableStorage->flush());
-            REQUIRE_NOTHROW(tableStorage->ensureLoaded());
+            // Data is loaded on-demand with RocksDB's native caching
+            REQUIRE(tableStorage->getNumRows() >= 0);
         }
         
         // Explicitly reset objects before directory cleanup

@@ -6,8 +6,10 @@
 #include <rocksdb/table.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/cache.h>
+#include <rocksdb/statistics.h>
 #include <filesystem>
 #include <iostream>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace lingodb::runtime {
@@ -242,19 +244,51 @@ rocksdb::Options RocksDBStorage::getDefaultOptions() {
     options.create_if_missing = true;
     options.create_missing_column_families = true;
     
-    // Performance tuning
-    options.write_buffer_size = 64 * 1024 * 1024; // 64MB
-    options.max_write_buffer_number = 3;
-    options.target_file_size_base = 64 * 1024 * 1024; // 64MB
-    options.max_background_jobs = 4;
+    // Performance tuning - optimized for column storage
+    options.write_buffer_size = 128 * 1024 * 1024; // 128MB write buffer
+    options.max_write_buffer_number = 4;
+    options.min_write_buffer_number_to_merge = 2;
+    options.target_file_size_base = 128 * 1024 * 1024; // 128MB SST files
+    options.max_background_jobs = 8;
+    options.max_background_compactions = 4;
+    options.max_background_flushes = 2;
     
-    // Compression
-    options.compression = rocksdb::kSnappyCompression;
+    // Level compaction for better read performance
+    options.level_compaction_dynamic_level_bytes = true;
+    options.max_bytes_for_level_base = 512 * 1024 * 1024; // 512MB
     
-    // Block cache for better read performance
+    // Compression - use LZ4 for better performance
+    options.compression = rocksdb::kLZ4Compression;
+    options.bottommost_compression = rocksdb::kZSTD; // Better compression for cold data
+    
+    // Block cache for better read performance - increased size
     rocksdb::BlockBasedTableOptions table_options;
-    table_options.block_cache = rocksdb::NewLRUCache(256 * 1024 * 1024); // 256MB cache
+    
+    // Use larger block cache (1GB by default, can be configured)
+    size_t cache_size = std::getenv("ROCKSDB_CACHE_SIZE") ? 
+        std::stoull(std::getenv("ROCKSDB_CACHE_SIZE")) : (1024 * 1024 * 1024);
+    table_options.block_cache = rocksdb::NewLRUCache(cache_size);
+    
+    // Pin L0 index and filter blocks in cache
+    table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+    
+    // Larger block size for column data
+    table_options.block_size = 32 * 1024; // 32KB blocks
+    
+    // Bloom filter for faster lookups
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
+    
+    // Cache index and filter blocks
+    table_options.cache_index_and_filter_blocks = true;
+    table_options.cache_index_and_filter_blocks_with_high_priority = true;
+    
+    // Direct I/O can cause issues on some systems, disable for now
+    // options.use_direct_reads = true;
+    // options.use_direct_io_for_flush_and_compaction = true;
+    
+    // Enable statistics for monitoring
+    options.statistics = rocksdb::CreateDBStatistics();
+    
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
     
     return options;

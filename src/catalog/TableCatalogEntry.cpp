@@ -107,7 +107,8 @@ void RocksDBTableCatalogEntry::setDBDir(std::string dbDir) {
 }
 
 void RocksDBTableCatalogEntry::ensureFullyLoaded() {
-   impl->ensureLoaded();
+   // With RocksDB's native caching, data is loaded on-demand
+   // No explicit loading needed
 }
 
 runtime::TableStorage& RocksDBTableCatalogEntry::getTableStorage() {
